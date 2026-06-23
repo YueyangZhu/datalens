@@ -1,5 +1,5 @@
-// PDF导出工具 - 浏览器原生打印方案
-// 最可靠：生成HTML → 新窗口 → 自动打印 → 自动关闭，浏览器原生渲染中文
+// PDF导出工具 - 静默打印方案（无弹窗、无新标签）
+// 使用隐藏iframe实现，用户体验和原生PDF导出一致
 
 import * as echarts from 'echarts'
 import type { AnalysisResult } from '../types'
@@ -38,34 +38,38 @@ export async function exportToPDFReport(
   }
 
   const html = buildFullHTML(result, chartImages)
-  const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const w = window.open(url, '_blank')
-  if (!w) {
-    // 如果弹窗被拦截，使用下载HTML方式
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${result.fileName.replace(/[^\w\u4e00-\u9fa5.-]/g, '_')}_报告.html`
-    a.click()
-    URL.revokeObjectURL(url)
-    throw new Error('弹窗被拦截，已将报告下载为HTML文件，可手动打印为PDF')
+  
+  // 创建隐藏iframe
+  const iframe = document.createElement('iframe')
+  iframe.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;border:none;'
+  document.body.appendChild(iframe)
+  
+  const doc = iframe.contentDocument || iframe.contentWindow?.document
+  if (!doc) {
+    document.body.removeChild(iframe)
+    throw new Error('无法创建打印窗口')
   }
   
-  w.onload = () => {
-    // 等待渲染完成
-    setTimeout(() => {
-      w.print()
-      // 打印对话框关闭后自动关闭窗口
-      w.addEventListener('afterprint', () => w.close())
-      // 备选：一定时间后关闭
-      setTimeout(() => {
-        try { w.close() } catch {}
-      }, 60000)
-    }, 1000)
+  doc.open()
+  doc.write(html)
+  doc.close()
+  
+  // 等待渲染完成
+  await new Promise<void>(resolve => setTimeout(resolve, 500))
+  
+  // 调用打印
+  const win = iframe.contentWindow
+  if (win) {
+    win.focus()
+    win.print()
   }
   
-  // 清理 blob URL
-  setTimeout(() => URL.revokeObjectURL(url), 120000)
+  // 打印完成后清理iframe（延迟确保打印对话框已弹出）
+  setTimeout(() => {
+    if (document.body.contains(iframe)) {
+      document.body.removeChild(iframe)
+    }
+  }, 1000)
 }
 
 function buildFullHTML(r: AnalysisResult, chartImages: string[]): string {
@@ -127,12 +131,9 @@ tr:nth-child(even) td { background: #f8fafc; }
 .footer-section p { font-size: 11px; color: #94a3b8; line-height: 1.8; margin: 3px 0; }
 .footer-section strong { color: #64748b; }
 
-.print-btn { position: fixed; top: 10px; right: 10px; z-index: 9999; background: #2563eb; color: white; border: none; border-radius: 6px; padding: 8px 20px; font-size: 14px; cursor: pointer; font-family: 'Microsoft YaHei', sans-serif; }
-.print-btn:hover { background: #1d4ed8; }
-@media print { .print-btn { display: none; } }
+@media print { body { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
 </style></head>
 <body>
-<button class="print-btn" onclick="window.print()">保存为 PDF</button>
 ${buildCover(r, now)}
 ${buildBody(r, chartImages)}
 </body></html>`
