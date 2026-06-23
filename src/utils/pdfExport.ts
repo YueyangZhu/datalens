@@ -1,547 +1,426 @@
-// PDF导出工具 - 专业格式数据分析报告（支持中文）
+// PDF导出工具 - html2canvas 完整渲染方案
+// 核心思路：浏览器原生渲染中文 → html2canvas截图 → jsPDF拼页，彻底避免jsPDF字体问题
+//
+// A4尺寸对应：
+//   像素（@96dpi）: 794 × 1122
+//   毫米：210 × 297
+//   html2canvas scale=2 → canvas: 1588 × 2244/页
 
 import jsPDF from 'jspdf'
 import html2canvas from 'html2canvas'
 import type { AnalysisResult } from '../types'
 
-// ============ 类型定义 ============
+// ============ 常量 ============
 
-/** RGB颜色数组 */
-type RGB = [number, number, number]
+/** 报告内容宽度（px，对应A4 210mm - 左右边距） */
+const RW = 760
+/** A4 一页高度（px @96dpi） */
+const PH_PX = 1122
+/** html2canvas 缩放倍率 */
+const SCALE = 2
+/** 边距 */
+const PAD = 32
 
-/** 颜色方案 */
-const C = {
-  primary: [37, 99, 235] as RGB,
-  text: [30, 41, 59] as RGB,
-  textLight: [100, 116, 139] as RGB,
-  border: [226, 232, 240] as RGB,
-  bgLight: [248, 250, 252] as RGB,
-  bgCard: [255, 255, 255] as RGB,
-  positive: [22, 163, 74] as RGB,
-  negative: [239, 68, 68] as RGB,
-  warning: [245, 158, 11] as RGB,
-  info: [59, 130, 246] as RGB,
-} as const
-
+/** 中文标题英文字体（DataLens品牌） */
 const TYPE_LABELS: Record<string, string> = {
   number: '数值型', string: '文本型', date: '日期型', boolean: '布尔型',
 }
 const INSIGHT_LABELS: Record<string, string> = {
   positive: '优势', negative: '风险', warning: '注意', info: '信息',
 }
-
-/** 中文字体名称（注册到 jsPDF 后使用） */
-const CN_FONT = 'NotoSansSC'
-
-// ============ 常量 ============
-const PW = 210    // A4宽
-const PH = 297    // A4高
-const ML = 18     // 左边距
-const MR = 18     // 右边距
-const MT = 20     // 上边距
-const MB = 15     // 下边距
-const CW = PW - ML - MR // 内容宽度
-
-// ============ 字体加载 ============
-
-let fontLoaded = false
-
-/**
- * 异步加载中文字体并注册到 jsPDF
- * 使用 VFS（虚拟文件系统）方式嵌入字体
- */
-async function loadChineseFont(pdf: jsPDF): Promise<void> {
-  if (fontLoaded) return
-
-  try {
-    const resp = await fetch('/fonts/NotoSansSC2.ttf')
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-    const fontBytes = await resp.arrayBuffer()
-    const fontArray = new Uint8Array(fontBytes)
-
-    // 转换为 base64 字符串（jsPDF addFileToVFS 需要 string 类型）
-    let binary = ''
-    for (let i = 0; i < fontArray.length; i++) {
-      binary += String.fromCharCode(fontArray[i])
-    }
-    const base64 = btoa(binary)
-
-    // 注册到 jsPDF VFS
-    const fontName = 'NotoSansSC'
-    pdf.addFileToVFS('NotoSansSC2.ttf', base64)
-    pdf.addFont('NotoSansSC2.ttf', fontName, 'normal')
-    pdf.addFont('NotoSansSC2.ttf', fontName, 'bold')
-    pdf.addFont('NotoSansSC2.ttf', fontName, 'italic')
-    pdf.addFont('NotoSansSC2.ttf', fontName, 'bolditalic')
-
-    fontLoaded = true
-    console.log('[PDF] 中文字体加载成功')
-  } catch (err) {
-    console.error('[PDF] 中文字体加载失败:', err)
-    // 加载失败时回退到默认字体（中文会显示为乱码，但不崩溃）
-  }
+const INSIGHT_COLORS: Record<string, string> = {
+  positive: '#16a34a', negative: '#ef4444', warning: '#f59e0b', info: '#3b82f6',
 }
 
-// ============ 颜色辅助函数 ============
-function fc(pdf: jsPDF, r: number, g: number, b: number) { pdf.setFillColor(r, g, b) }
-function fcA(pdf: jsPDF, r: number, g: number, b: number, a: number) { pdf.setFillColor(r, g, b, a) }
-function dc(pdf: jsPDF, r: number, g: number, b: number) { pdf.setDrawColor(r, g, b) }
-function tc(pdf: jsPDF, r: number, g: number, b: number) { pdf.setTextColor(r, g, b) }
+// ============ 主入口 ============
 
-function colorOf(type: string): [number, number, number] {
-  switch (type) {
-    case 'positive': return [C.positive[0], C.positive[1], C.positive[2]]
-    case 'negative': return [C.negative[0], C.negative[1], C.negative[2]]
-    case 'warning': return [C.warning[0], C.warning[1], C.warning[2]]
-    default: return [C.info[0], C.info[1], C.info[2]]
-  }
-}
-
-/** 设置中文字体 */
-function setCN(pdf: jsPDF, style: 'normal' | 'bold' | 'italic' = 'normal') {
-  pdf.setFont(CN_FONT, style)
-}
-
-/**
- * 导出分析结果为专业PDF报告（主入口）
- */
 export async function exportToPDFReport(
   result: AnalysisResult,
   chartElements?: HTMLDivElement[]
 ): Promise<void> {
+  // 第1步：截图图表
+  const chartImages = await captureChartImages(chartElements || [])
+
+  // 第2步：生成完整报告HTML
+  const html = buildReportHTML(result, chartImages)
+
+  // 第3步：挂载到隐藏容器，等图片加载完
+  const container = document.createElement('div')
+  container.style.cssText = 'position:fixed;left:-9999px;top:0;width:794px;z-index:99999;'
+  container.innerHTML = html
+  document.body.appendChild(container)
+
+  // 等待图片加载
+  const imgs = container.querySelectorAll('img')
+  await Promise.all(Array.from(imgs).map(
+    img => img.complete ? Promise.resolve() : new Promise<void>(r => { img.onload = () => r(); img.onerror = () => r() })
+  ))
+  await new Promise(r => setTimeout(r, 200))
+
+  // 第4步：html2canvas 整体截图
+  const fullCanvas = await html2canvas(container, {
+    scale: SCALE,
+    backgroundColor: '#ffffff',
+    logging: false,
+    useCORS: true,
+    allowTaint: true,
+  })
+
+  document.body.removeChild(container)
+
+  // 第5步：按页裁切，逐页放入 jsPDF
+  const pageH = PH_PX * SCALE // 2244
+  const totalPages = Math.ceil(fullCanvas.height / pageH)
+
   const pdf = new jsPDF('p', 'mm', 'a4')
 
-  // 加载中文字体
-  await loadChineseFont(pdf)
-  let y = MT
+  for (let p = 0; p < totalPages; p++) {
+    if (p > 0) pdf.addPage()
 
-  // ---- 封面页 ----
-  drawCover(pdf, result)
-  pdf.addPage()
+    const sy = p * pageH
+    const sh = Math.min(pageH, fullCanvas.height - sy)
 
-  // ---- 执行摘要 ----
-  y = MT
-  y = drawSummary(pdf, result, y)
+    const pageCanvas = document.createElement('canvas')
+    pageCanvas.width = fullCanvas.width
+    pageCanvas.height = sh
+    const ctx = pageCanvas.getContext('2d')!
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height)
+    ctx.drawImage(fullCanvas, 0, sy, fullCanvas.width, sh, 0, 0, fullCanvas.width, sh)
 
-  // ---- 数据概览 ----
-  checkPage(pdf, y, 40)
-  y = sectionTitle(pdf, y, '一、数据概览')
-  y = drawOverview(pdf, result, y + 5)
-
-  // ---- 图表 ----
-  if (result.charts.length > 0) {
-    checkPage(pdf, y, 50)
-    y = sectionTitle(pdf, y, '二、可视化图表')
-    y += 3
-
-    for (let i = 0; i < result.charts.length; i++) {
-      const chartEl = chartElements?.[i]
-      if (!checkPage(pdf, y, 70)) y = MT
-      y = await drawChart(pdf, result.charts[i], chartEl, y)
-      y += 3
-    }
+    pdf.addImage(pageCanvas.toDataURL('image/png', 0.95), 'PNG', 0, 0, 210, (sh / fullCanvas.width) * 210)
   }
-
-  // ---- 字段详情 ----
-  checkPage(pdf, y, 35)
-  y = sectionTitle(pdf, y, '三、字段详情')
-  y = drawFields(pdf, result.columns, y + 5)
-
-  // ---- 洞察与建议 ----
-  if (result.insights.length > 0) {
-    checkPage(pdf, y, 30)
-    y = sectionTitle(pdf, y, '四、洞察与建议')
-    y = drawInsights(pdf, result.insights, y + 5)
-  }
-
-  // ---- 尾部声明 ----
-  checkPage(pdf, y, 25)
-  y = drawDisclaimer(pdf, y)
-
-  // ---- 全局页脚 ----
-  addFooters(pdf)
 
   const safeName = result.fileName.replace(/[^\w\u4e00-\u9fa5.-]/g, '_')
   pdf.save(`${safeName}_数据分析报告.pdf`)
 }
 
-// ==================== 封面 ====================
-function drawCover(pdf: jsPDF, r: AnalysisResult): void {
-  // 蓝色头部区域
-  fc(pdf, 37, 99, 235)
-  pdf.rect(0, 0, PW, 115, 'F')
-  // 金色装饰条
-  fc(pdf, 245, 158, 11)
-  pdf.rect(0, 113, PW, 4, 'F')
+// ============ 图表截图 ============
 
-  // 主标题 - DataLens（用英文默认字体）
-  pdf.setTextColor(255, 255, 255)
-  pdf.setFontSize(32)
-  pdf.setFont('helvetica', 'bold')
-  pdf.text('DataLens', ML + 5, 52)
-
-  // 副标题 - 智能数据分析报告（中文）
-  pdf.setFontSize(16)
-  setCN(pdf, 'normal')
-  pdf.text('智能数据分析报告', ML + 5, 66)
-
-  // 元信息区 - 标签列
-  let iy = 138
-  const lh = 13
-  setCN(pdf, 'normal'); pdf.setFontSize(10); tc(pdf, 100, 116, 139)
-  pdf.text('报告文件', ML + 10, iy); iy += lh
-  pdf.text('生成时间', ML + 10, iy); iy += lh
-  pdf.text('数据规模', ML + 10, iy); iy += lh
-  pdf.text('缺失率', ML + 10, iy); iy += lh
-  pdf.text('重复行数', ML + 10, iy)
-
-  // 元信息区 - 值列
-  iy = 138
-  setCN(pdf, 'normal'); pdf.setFontSize(11); tc(pdf, 30, 41, 59)
-  pdf.text(r.fileName || '-', ML + 48, iy); iy += lh
-  pdf.text(formatDate(r.uploadTime), ML + 48, iy); iy += lh
-  pdf.text(`${r.overview.rowCount.toLocaleString()} 行 × ${r.overview.colCount} 列`, ML + 48, iy); iy += lh
-  pdf.text(`${r.overview.missingPercent.toFixed(1)}%`, ML + 48, iy); iy += lh
-  pdf.text(`${r.overview.duplicateRows} 行`, ML + 48, iy)
-
-  // 底部品牌
-  setCN(pdf, 'normal'); pdf.setFontSize(8); tc(pdf, 100, 116, 139)
-  pdf.text(
-    '本报告由 DataLens 智能数据分析平台自动生成',
-    PW / 2, PH - 22, { align: 'center' })
-  pdf.text(
-    `报告生成时间：${new Date().toLocaleString('zh-CN')}`,
-    PW / 2, PH - 14, { align: 'center' })
+async function captureChartImages(chartElements: HTMLDivElement[]): Promise<string[]> {
+  const images: string[] = []
+  for (const el of chartElements) {
+    try {
+      if (el.offsetWidth === 0) { images.push(''); continue }
+      const cvs = await html2canvas(el, { scale: 2, useCORS: true, backgroundColor: '#ffffff', logging: false })
+      images.push(cvs.toDataURL('image/png', 0.9))
+    } catch {
+      images.push('')
+    }
+  }
+  return images
 }
 
-// ==================== 执行摘要 ====================
-function drawSummary(pdf: jsPDF, r: AnalysisResult, startY: number): number {
-  let y = startY
-  setCN(pdf, 'bold'); pdf.setFontSize(18); tc(pdf, 37, 99, 235)
-  pdf.text('执行摘要', ML, y)
-  y += 9
-  dc(pdf, 226, 232, 240); pdf.setLineWidth(0.5)
-  pdf.line(ML, y, PW - MR, y)
-  y += 7
+// ============ HTML 报告生成 ============
 
-  // 四个指标卡片
-  fc(pdf, 248, 250, 252)
-  pdf.roundedRect(ML, y, CW, 26, 3, 3, 'F')
+function buildReportHTML(result: AnalysisResult, chartImages: string[]): string {
+  const now = new Date().toLocaleString('zh-CN')
+  const css = reportCSS()
 
-  const cardW = CW / 4
-  const cards: [string, string, RGB][] = [
-    ['总行数', `${r.overview.rowCount.toLocaleString()}`, [37, 99, 235]],
-    ['总列数', `${r.overview.colCount}`, [59, 130, 246]],
-    ['缺失值', `${r.overview.missingCells.toLocaleString()} (${r.overview.missingPercent.toFixed(1)}%)`, [245, 158, 11]],
-    ['重复行', `${r.overview.duplicateRows}`, [239, 68, 68]],
+  let html = `<div style="font-family:-apple-system,'Microsoft YaHei','PingFang SC','Noto Sans SC',sans-serif;color:#1e293b;background:#fff;width:794px;margin:0 auto;box-sizing:border-box;">`
+
+  // ===== 封面 =====
+  html += buildCoverHTML(result, now)
+
+  // ===== 内容区（从新页开始） =====
+  html += `<div class="page-start"></div>`
+
+  // ===== 一、执行摘要 =====
+  html += buildSummaryHTML(result)
+
+  // ===== 二、数据概览 =====
+  html += buildOverviewHTML(result)
+
+  // ===== 三、可视化图表 =====
+  if (result.charts.length > 0) {
+    html += buildChartsHTML(result.charts, chartImages)
+  }
+
+  // ===== 四、字段详情 =====
+  html += buildFieldsHTML(result.columns)
+
+  // ===== 五、洞察与建议 =====
+  if (result.insights.length > 0) {
+    html += buildInsightsHTML(result.insights)
+  }
+
+  // ===== 尾部声明 =====
+  html += buildDisclaimerHTML(now)
+
+  html += `</div>${css}`
+  return html
+}
+
+// ==================== 报告CSS ====================
+
+function reportCSS(): string {
+  return `
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  .page-start { page-break-before:always; break-before:page; height:1px; margin:0; }
+  .page-footer { height:50px; border-top:1px solid #e2e8f0; text-align:center; padding-top:14px; font-size:12px; color:#94a3b8; }
+  .section { padding:${PAD}px ${PAD}px 0 ${PAD}px; }
+  .section-title { font-size:22px; font-weight:700; color:#2563eb; padding-left:14px; border-left:4px solid #2563eb; margin-bottom:18px; line-height:1.3; }
+  .card-row { display:flex; gap:14px; margin:14px 0; }
+  .card { flex:1; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:16px 12px; text-align:center; }
+  .card-value { font-size:26px; font-weight:700; }
+  .card-label { font-size:12px; color:#64748b; margin-top:4px; }
+  table { width:100%; border-collapse:collapse; margin:12px 0; }
+  th { background:#eff6ff; color:#1e40af; font-size:13px; font-weight:600; padding:10px 12px; text-align:left; border-bottom:2px solid #bfdbfe; }
+  td { padding:9px 12px; font-size:12px; border-bottom:1px solid #f1f5f9; }
+  tr:nth-child(even) td { background:#f8fafc; }
+  .chart-box { margin:16px 0; }
+  .chart-box h3 { font-size:15px; font-weight:700; color:#1e293b; margin-bottom:4px; }
+  .chart-box p { font-size:12px; color:#64748b; margin-bottom:8px; line-height:1.5; }
+  .chart-box img { width:100%; max-width:100%; border-radius:6px; border:1px solid #f1f5f9; }
+  .insight-card { background:#fff; border:1px solid #e2e8f0; border-radius:8px; margin:10px 0; overflow:hidden; display:flex; }
+  .insight-bar { width:5px; flex-shrink:0; }
+  .insight-body { flex:1; padding:14px 16px; }
+  .insight-title { font-size:14px; font-weight:700; margin-bottom:4px; }
+  .insight-meta { display:flex; gap:16px; align-items:center; margin-bottom:6px; }
+  .insight-badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; font-weight:600; background:var(--bc); color:#fff; opacity:0.9; }
+  .insight-confidence { font-size:11px; color:#94a3b8; }
+  .insight-content { font-size:12px; color:#475569; line-height:1.6; }
+  .disclaimer { font-size:12px; color:#94a3b8; line-height:1.8; padding:20px 0 0 0; }
+  .disclaimer p { margin:4px 0; }
+  .cover { background:linear-gradient(135deg,#1d4ed8 0%,#2563eb 40%,#3b82f6 100%); color:#fff; padding:80px ${PAD}px 40px ${PAD}px; position:relative; min-height:500px; }
+  .cover-accent { position:absolute; bottom:0; left:0; right:0; height:5px; background:#f59e0b; }
+  .cover h1 { font-size:40px; font-weight:800; letter-spacing:1px; }
+  .cover h2 { font-size:20px; font-weight:400; opacity:0.9; margin-top:12px; }
+  .cover-meta { margin-top:60px; display:grid; grid-template-columns:80px 1fr; gap:10px 20px; font-size:14px; }
+  .cover-meta-label { opacity:0.7; }
+  .cover-bottom { font-size:11px; opacity:0.6; margin-top:80px; text-align:center; }
+</style>`
+}
+
+// ==================== 封面 ====================
+
+function buildCoverHTML(r: AnalysisResult, now: string): string {
+  return `
+<div class="cover">
+  <h1>DataLens</h1>
+  <h2>智能数据分析报告</h2>
+  <div class="cover-meta">
+    <span class="cover-meta-label">报告文件：</span><span>${esc(r.fileName)}</span>
+    <span class="cover-meta-label">生成时间：</span><span>${esc(formatDate(r.uploadTime))}</span>
+    <span class="cover-meta-label">数据规模：</span><span>${r.overview.rowCount.toLocaleString()} 行 × ${r.overview.colCount} 列</span>
+    <span class="cover-meta-label">数据缺失率：</span><span>${r.overview.missingPercent.toFixed(1)}%</span>
+    <span class="cover-meta-label">重复行数：</span><span>${r.overview.duplicateRows} 行</span>
+  </div>
+  <div class="cover-bottom">本报告由 DataLens 智能数据分析平台自动生成 · ${now}</div>
+  <div class="cover-accent"></div>
+</div>`
+}
+
+// ==================== 摘要 ====================
+
+function buildSummaryHTML(r: AnalysisResult): string {
+  const cards = [
+    { label: '总行数', value: r.overview.rowCount.toLocaleString(), color: '#2563eb' },
+    { label: '总列数', value: String(r.overview.colCount), color: '#3b82f6' },
+    { label: '缺失值', value: `${r.overview.missingCells.toLocaleString()} (${r.overview.missingPercent.toFixed(1)}%)`, color: '#f59e0b' },
+    { label: '重复行', value: String(r.overview.duplicateRows), color: '#ef4444' },
   ]
 
-  for (let i = 0; i < 4; i++) {
-    const cx = ML + cardW * i + cardW / 2
-    const cc = cards[i][2]
-    tc(pdf, cc[0], cc[1], cc[2]); pdf.setFontSize(15); setCN(pdf, 'bold')
-    pdf.text(cards[i][1], cx, y + 11, { align: 'center' })
-    tc(pdf, 100, 116, 139); pdf.setFontSize(8); setCN(pdf, 'normal')
-    pdf.text(cards[i][0], cx, y + 20, { align: 'center' })
-  }
-  y += 31
-
-  // 核心发现
-  if (r.insights.length > 0) {
-    setCN(pdf, 'bold'); pdf.setFontSize(11); tc(pdf, 30, 41, 59)
-    pdf.text('核心发现', ML, y)
-    y += 6
-
-    const top = r.insights.slice(0, 6)
-    for (const ins of top) {
-      if (y > PH - MB - 12) break
-      const ic = colorOf(ins.type)
+  const topInsights = r.insights.slice(0, 6)
+  let insightHTML = ''
+  if (topInsights.length > 0) {
+    insightHTML = `<h3 style="font-size:15px;font-weight:700;color:#1e293b;margin:20px 0 10px 0;">核心发现</h3>`
+    for (const ins of topInsights) {
+      const c = INSIGHT_COLORS[ins.type] || '#3b82f6'
       const label = INSIGHT_LABELS[ins.type] || '信息'
-
-      // 圆点标记
-      fc(pdf, ic[0], ic[1], ic[2])
-      pdf.circle(ML + 3, y, 2, 'F')
-      // 标签底色
-      fc(pdf, ic[0], ic[1], ic[2])
-      setCN(pdf, 'bold'); pdf.setFontSize(7)
-      const lw = pdf.getTextWidth(label) + 6
-      pdf.roundedRect(ML + 8, y - 3.5, lw, 6, 1.5, 1.5, 'F')
-      pdf.setTextColor(255, 255, 255)
-      pdf.text(label, ML + 11, y)
-
-      // 内容文字
-      tc(pdf, 30, 41, 59); setCN(pdf, 'normal'); pdf.setFontSize(9)
-      const tx = ML + lw + 14
-      const lines = pdf.splitTextToSize(ins.title, PW - MR - tx)
-      pdf.text(lines, tx, y)
-      y += Math.max(9, lines.length * 4.5) + 2
+      insightHTML += `
+      <div style="display:flex;align-items:flex-start;gap:10px;margin:8px 0;font-size:13px;line-height:1.5;">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${c};flex-shrink:0;margin-top:5px;"></span>
+        <span style="display:inline-block;background:${c};color:#fff;font-size:10px;font-weight:600;padding:1px 7px;border-radius:9px;flex-shrink:0;margin-top:2px;">${esc(label)}</span>
+        <span style="color:#475569;">${esc(ins.title)}</span>
+      </div>`
     }
   }
 
-  return y + 6
-}
-
-// ==================== 章节标题 ====================
-function sectionTitle(pdf: jsPDF, y: number, title: string): number {
-  fc(pdf, 37, 99, 235)
-  pdf.rect(ML, y - 3, 3, 13, 'F')          // 左侧蓝色竖条
-  tc(pdf, 37, 99, 235); pdf.setFontSize(14); setCN(pdf, 'bold')
-  pdf.text(title, ML + 9, y + 7)
-  dc(pdf, 226, 232, 240); pdf.setLineWidth(0.3)
-  pdf.line(ML, y + 12, PW - MR, y + 12)
-  return y + 17
+  return `
+  <div class="page-start"></div>
+  <div class="section">
+    <div class="section-title">一、执行摘要</div>
+    <div class="card-row">
+      ${cards.map(c => `
+        <div class="card">
+          <div class="card-value" style="color:${c.color}">${esc(c.value)}</div>
+          <div class="card-label">${esc(c.label)}</div>
+        </div>
+      `).join('')}
+    </div>
+    ${insightHTML}
+    <div class="page-footer"></div>
+  </div>`
 }
 
 // ==================== 数据概览 ====================
-function drawOverview(pdf: jsPDF, r: AnalysisResult, startY: number): number {
-  let y = startY
 
-  setCN(pdf, 'normal'); pdf.setFontSize(10); tc(pdf, 100, 116, 139)
-  const desc = `本次分析对文件「${r.fileName}」进行了全面的数据解读。该数据集共包含 ${r.overview.rowCount.toLocaleString()} 行记录和 ${r.overview.colCount} 个字段。`
-  pdf.text(pdf.splitTextToSize(desc, CW), ML, y)
-  y += 14
+function buildOverviewHTML(r: AnalysisResult): string {
+  const desc = `本次分析对文件「${esc(r.fileName)}」进行了全面的数据解读。该数据集共包含 ${r.overview.rowCount.toLocaleString()} 行记录和 ${r.overview.colCount} 个字段。`
 
-  // 表格数据
-  const tbl = [
-    ['数据维度', '数值', '评估'],
+  const rows = [
     ['总记录数', `${r.overview.rowCount.toLocaleString()} 行`, r.overview.rowCount >= 100 ? '样本量充足' : '样本量偏少'],
     ['字段数量', `${r.overview.colCount} 列`, r.overview.colCount >= 5 ? '维度丰富' : '维度较少'],
     ['缺失单元格', `${r.overview.missingCells.toLocaleString()} 个`, r.overview.missingPercent <= 5 ? '质量良好' : '需关注'],
     ['缺失比例', `${r.overview.missingPercent.toFixed(2)}%`, r.overview.missingPercent < 3 ? '可接受' : '建议处理'],
     ['完全重复行', `${r.overview.duplicateRows} 行`, r.overview.duplicateRows === 0 ? '无重复' : '存在重复'],
   ]
-  return simpleTable(pdf, tbl, y)
+
+  return `
+  <div class="page-start"></div>
+  <div class="section">
+    <div class="section-title">二、数据概览</div>
+    <p style="font-size:13px;color:#64748b;margin-bottom:14px;line-height:1.6;">${desc}</p>
+    <table>
+      <thead><tr><th>数据维度</th><th>数值</th><th>评估</th></tr></thead>
+      <tbody>
+        ${rows.map(r => `<tr><td>${esc(r[0])}</td><td>${esc(r[1])}</td><td style="color:#64748b;">${esc(r[2])}</td></tr>`).join('')}
+      </tbody>
+    </table>
+    <div class="page-footer"></div>
+  </div>`
 }
 
-// ==================== 图表块 ====================
-async function drawChart(
-  pdf: jsPDF,
-  chart: { id: string; title: string; type: string; description: string },
-  chartEl: HTMLElement | undefined,
-  startY: number
-): Promise<number> {
-  let y = startY
+// ==================== 图表 ====================
 
-  // 标题
-  tc(pdf, 30, 41, 59); setCN(pdf, 'bold'); pdf.setFontSize(11)
-  pdf.text(chart.title, ML, y)
-  y += 5
+function buildChartsHTML(
+  charts: Array<{ id: string; title: string; type: string; description: string }>,
+  chartImages: string[]
+): string {
+  let html = `<div class="page-start"></div><div class="section"><div class="section-title">三、可视化图表</div>`
 
-  // 描述
-  if (chart.description) {
-    tc(pdf, 100, 116, 139); setCN(pdf, 'normal'); pdf.setFontSize(8.5)
-    pdf.text(pdf.splitTextToSize(chart.description, CW), ML, y)
-    y += 9
-  } else {
-    y += 4
-  }
-
-  // 截图插入
-  if (chartEl && chartEl.offsetWidth > 0) {
-    try {
-      const canvas = await html2canvas(chartEl, {
-        scale: 2, useCORS: true, backgroundColor: '#ffffff', logging: false,
-      })
-      const img = canvas.toDataURL('image/png', 1.0)
-      const imgW = CW
-      const imgH = (canvas.height / canvas.width) * imgW
-      const finalH = Math.min(imgH, 82)
-      pdf.addImage(img, 'PNG', ML, y, imgW, finalH)
-      y += finalH + 3
-    } catch {
-      y += 5
+  for (let i = 0; i < charts.length; i++) {
+    const ch = charts[i]
+    const img = chartImages[i] || ''
+    html += `<div class="chart-box">`
+    html += `<h3>${esc(ch.title)}</h3>`
+    if (ch.description) html += `<p>${esc(ch.description)}</p>`
+    if (img) {
+      html += `<img src="${img}" alt="${esc(ch.title)}" style="display:block;" />`
+    } else {
+      html += `<div style="background:#f8fafc;border:1px dashed #e2e8f0;border-radius:6px;text-align:center;padding:40px 0;color:#94a3b8;font-size:13px;">[${ch.type.toUpperCase()}] ${esc(ch.title)}</div>`
     }
-  } else {
-    fc(pdf, 248, 250, 252)
-    pdf.roundedRect(ML, y, CW, 18, 2, 2, 'F')
-    tc(pdf, 100, 116, 139); setCN(pdf, 'normal'); pdf.setFontSize(9)
-    pdf.text(`[${chart.type.toUpperCase()}] ${chart.title}`, ML + CW / 2, y + 11, { align: 'center' })
-    y += 22
+    html += `</div>`
   }
 
-  return y
+  html += `<div class="page-footer"></div></div>`
+  return html
 }
 
-// ==================== 字段详情表 ====================
-function drawFields(
-  pdf: jsPDF,
+// ==================== 字段详情 ====================
+
+function buildFieldsHTML(
   cols: Array<{
     name: string; type: string; uniqueCount: number;
     missingCount: number; missingPercent: number;
     min?: number; max?: number; mean?: number; std?: number;
-  }>,
-  startY: number
-): number {
-  let y = startY
-
-  // 表头
-  const cws = [26, 16, 20, 20, 28, 28, 28]
-  const hdrs = ['字段名', '类型', '唯一值', '缺失率', '最小值', '最大值', '均值']
-  fc(pdf, 240, 246, 255)
-  pdf.rect(ML, y - 5, CW, 8, 'F')
-  pdf.setFontSize(8); tc(pdf, 30, 41, 59); setCN(pdf, 'bold')
-
-  let x = ML
-  for (let i = 0; i < hdrs.length; i++) { pdf.text(hdrs[i], x + 2, y); x += cws[i] }
-  y += 6
-
-  setCN(pdf, 'normal'); pdf.setFontSize(7.5)
-
-  for (let ri = 0; ri < cols.length; ri++) {
-    if (y > PH - MB - 8) {
-      pdf.addPage(); y = MT
-      fc(pdf, 240, 246, 255); pdf.rect(ML, y - 5, CW, 8, 'F')
-      setCN(pdf, 'bold'); x = ML
-      for (let i = 0; i < hdrs.length; i++) { pdf.text(hdrs[i], x + 2, y); x += cws[i] }
-      setCN(pdf, 'normal'); y += 6
-    }
-
-    const col = cols[ri]
-    if (ri % 2 === 0) { fc(pdf, 252, 252, 253); pdf.rect(ML, y - 4.5, CW, 7, 'F') }
-
-    tc(pdf, 30, 41, 59); x = ML
-
-    const nm = col.name.length > 7 ? col.name.slice(0, 6) + '..' : col.name
-    pdf.text(nm, x + 2, y); x += cws[0]
-
-    tc(pdf, 59, 130, 246)
-    pdf.text(TYPE_LABELS[col.type] || col.type, x + 2, y); x += cws[1]
-
-    tc(pdf, 30, 41, 59)
-    pdf.text(String(col.uniqueCount), x + 2, y); x += cws[2]
-    pdf.text(`${col.missingPercent.toFixed(1)}%`, x + 2, y); x += cws[3]
-
-    if (col.type === 'number' && col.min !== undefined) {
-      pdf.text(fmtN(col.min), x + 2, y); x += cws[4]
-      pdf.text(fmtN(col.max), x + 2, y); x += cws[5]
-      pdf.text(fmtN(col.mean), x + 2, y); x += cws[6]
-    } else {
-      x += cws[4] + cws[5] + cws[6]
-    }
-    y += 7
+  }>
+): string {
+  let rowsHTML = ''
+  for (const col of cols) {
+    const nm = col.name.length > 10 ? col.name.slice(0, 9) + '..' : col.name
+    const isNum = col.type === 'number'
+    rowsHTML += `<tr>
+      <td style="font-weight:500;">${esc(nm)}</td>
+      <td style="color:#3b82f6;">${esc(TYPE_LABELS[col.type] || col.type)}</td>
+      <td>${col.uniqueCount}</td>
+      <td>${col.missingPercent.toFixed(1)}%</td>
+      <td>${isNum && col.min != null ? fmtN(col.min) : '-'}</td>
+      <td>${isNum && col.max != null ? fmtN(col.max) : '-'}</td>
+      <td>${isNum && col.mean != null ? fmtN(col.mean) : '-'}</td>
+    </tr>`
   }
 
-  y += 5
   const nc = cols.filter(c => c.type === 'number').length
   const st = cols.filter(c => c.type === 'string').length
   const dt = cols.filter(c => c.type === 'date').length
 
-  setCN(pdf, 'italic'); pdf.setFontSize(8.5); tc(pdf, 100, 116, 139)
-  pdf.text(`字段构成：${nc}个数值型 · ${st}个文本型 · ${dt}个日期型 · 共${cols.length}个字段`, ML, y)
-  return y + 8
+  return `
+  <div class="page-start"></div>
+  <div class="section">
+    <div class="section-title">四、字段详情</div>
+    <table>
+      <thead><tr><th>字段名</th><th>类型</th><th>唯一值</th><th>缺失率</th><th>最小值</th><th>最大值</th><th>均值</th></tr></thead>
+      <tbody>${rowsHTML}</tbody>
+    </table>
+    <p style="font-size:12px;color:#94a3b8;margin-top:8px;">字段构成：${nc}个数值型 · ${st}个文本型 · ${dt}个日期型 · 共${cols.length}个字段</p>
+    <div class="page-footer"></div>
+  </div>`
 }
 
-// ==================== 洞察列表 ====================
-function drawInsights(
-  pdf: jsPDF,
-  ins: Array<{ type: string; title: string; content: string; confidence: string }>,
-  startY: number
-): number {
-  let y = startY
+// ==================== 洞察 ====================
 
+function buildInsightsHTML(
+  ins: Array<{ type: string; title: string; content: string; confidence: string }>
+): string {
   // 分类统计
   const counts: Record<string, number> = {}
   for (const i of ins) counts[i.type] = (counts[i.type] || 0) + 1
 
-  fc(pdf, 248, 250, 252)
-  pdf.roundedRect(ML, y - 3, CW, 11, 2, 2, 'F')
+  let statsHTML = ''
+  for (const [tp, cnt] of Object.entries(counts)) {
+    const c = INSIGHT_COLORS[tp] || '#3b82f6'
+    const label = INSIGHT_LABELS[tp] || '信息'
+    statsHTML += `<span style="display:inline-block;margin-right:16px;color:${c};font-size:12px;font-weight:600;">● ${label} ${cnt}</span>`
+  }
 
-  let sx = ML + 6
-  pdf.setFontSize(8)
-  Object.entries(counts).forEach(([tp, cnt]) => {
-    const ic = colorOf(tp)
-    fc(pdf, ic[0], ic[1], ic[2])
-    pdf.circle(sx, y + 2, 1.8, 'F')
-    tc(pdf, ic[0], ic[1], ic[2]); setCN(pdf, 'bold')
-    pdf.text(`${INSIGHT_LABELS[tp]} ${cnt}`, sx + 3, y + 3.5)
-    sx += pdf.getTextWidth(`${INSIGHT_LABELS[tp]} ${cnt}`) + 12
-  })
-
-  y += 15
-
+  let cardsHTML = ''
   for (let i = 0; i < ins.length; i++) {
     const item = ins[i]
+    const c = INSIGHT_COLORS[item.type] || '#3b82f6'
+    const cl = item.confidence === 'high' ? '高置信度' : item.confidence === 'medium' ? '中等置信度' : '参考性质'
+    const label = INSIGHT_LABELS[item.type] || '信息'
+    const num = String(i + 1).padStart(2, '0')
 
-    if (y > PH - MB - 22) { pdf.addPage(); y = MT }
-
-    const ch = 20 + (item.content.length > 55 ? 8 : 0)
-    fc(pdf, 255, 255, 255)
-    dc(pdf, 226, 232, 240); pdf.setLineWidth(0.3)
-    pdf.roundedRect(ML, y - 3, CW, ch, 2, 2, 'FD')
-
-    // 左侧色条
-    const barColor = colorOf(item.type)
-    fc(pdf, barColor[0], barColor[1], barColor[2])
-    pdf.rect(ML, y - 3, 3, ch, 'F')
-
-    // 编号圆圈
-    fc(pdf, barColor[0], barColor[1], barColor[2])
-    pdf.circle(ML + 9, y + 2.5, 4.5, 'F')
-    pdf.setTextColor(255, 255, 255); setCN(pdf, 'bold'); pdf.setFontSize(7.5)
-    pdf.text(`${(i + 1).toString().padStart(2, '0')}`, ML + 9, y + 4.5, { align: 'center' })
-
-    // 标题
-    tc(pdf, barColor[0], barColor[1], barColor[2]); setCN(pdf, 'bold'); pdf.setFontSize(10)
-    pdf.text(item.title, ML + 17, y + 3.5)
-
-    // 置信度标签
-    const cl = confLabel(item.confidence)
-    const cw_ = pdf.getTextWidth(cl) + 6
-    fcA(pdf, barColor[0], barColor[1], barColor[2], 18)
-    pdf.roundedRect(PW - MR - cw_ - 1, y - 0.5, cw_, 5.5, 1, 1, 'F')
-    tc(pdf, barColor[0], barColor[1], barColor[2]); setCN(pdf, 'normal'); pdf.setFontSize(7)
-    pdf.text(cl, PW - MR - cw_ + 1, y + 2.5)
-
-    // 内容
-    tc(pdf, 30, 41, 59); setCN(pdf, 'normal'); pdf.setFontSize(8.5)
-    const lines = pdf.splitTextToSize(item.content, CW - 24)
-    pdf.text(lines, ML + 17, y + 12)
-
-    y += ch + 4
+    cardsHTML += `
+    <div class="insight-card">
+      <div class="insight-bar" style="background:${c};"></div>
+      <div class="insight-body">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">
+          <span style="display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;background:${c};color:#fff;font-size:11px;font-weight:700;flex-shrink:0;">${num}</span>
+          <span class="insight-title" style="color:${c};">${esc(item.title)}</span>
+        </div>
+        <div class="insight-meta">
+          <span class="insight-badge" style="--bc:${c};">${esc(label)}</span>
+          <span class="insight-confidence">${esc(cl)}</span>
+        </div>
+        <div class="insight-content">${esc(item.content)}</div>
+      </div>
+    </div>`
   }
 
-  return y
+  return `
+  <div class="page-start"></div>
+  <div class="section">
+    <div class="section-title">五、洞察与建议</div>
+    <div style="background:#f8fafc;border-radius:8px;padding:12px 16px;margin-bottom:16px;">
+      ${statsHTML}
+    </div>
+    ${cardsHTML}
+    <div class="page-footer"></div>
+  </div>`
 }
 
-// ==================== 尾部声明 ====================
-function drawDisclaimer(pdf: jsPDF, startY: number): number {
-  let y = startY + 4
-  dc(pdf, 226, 232, 240); pdf.setLineWidth(0.5)
-  pdf.line(ML, y, PW - MR, y)
-  y += 7
+// ==================== 声明 ====================
 
-  setCN(pdf, 'normal'); pdf.setFontSize(8.5); tc(pdf, 100, 116, 139)
-
-  const notes = [
-    '报告声明：本报告由 DataLens 智能数据分析平台基于规则引擎自动生成，仅供参考。',
-    '数据处理：所有数据均在浏览器本地完成处理和分析，不会上传至任何外部服务器。',
-    '建议操作：如发现异常数据或需要更深入的分析，建议结合业务背景进行人工复核。',
-  ]
-  for (const note of notes) {
-    const ls = pdf.splitTextToSize(note, CW)
-    pdf.text(ls, ML, y)
-    y += ls.length * 4 + 3
-  }
-  return y
+function buildDisclaimerHTML(now: string): string {
+  return `
+  <div class="page-start"></div>
+  <div class="section" style="padding-bottom:40px;">
+    <div class="disclaimer">
+      <p><strong>报告声明：</strong>本报告由 DataLens 智能数据分析平台基于规则引擎自动生成，仅供参考。分析结果受数据质量和算法限制影响，不构成任何业务决策建议。</p>
+      <p style="margin-top:8px;"><strong>数据处理：</strong>所有数据均在浏览器本地完成处理和分析，不会上传至任何外部服务器，确保数据安全与隐私。</p>
+      <p style="margin-top:8px;"><strong>生成时间：</strong>${now}</p>
+    </div>
+  </div>`
 }
 
-// ==================== 页脚 ====================
-function addFooters(pdf: jsPDF): void {
-  const total = pdf.getNumberOfPages()
-  for (let p = 1; p <= total; p++) {
-    pdf.setPage(p)
-    dc(pdf, 226, 232, 240); pdf.setLineWidth(0.3)
-    pdf.line(ML, PH - MB + 2, PW - MR, PH - MB + 2)
-    setCN(pdf, 'normal'); pdf.setFontSize(8); tc(pdf, 100, 116, 139)
-    pdf.text(`第 ${p} / ${total} 页`, PW / 2, PH - 8, { align: 'center' })
-    pdf.text('DataLens 智能数据分析平台', PW - MR, PH - 8, { align: 'right' })
-  }
-}
+// ============ 工具函数 ============
 
-// ==================== 工具函数 ====================
-function checkPage(pdf: jsPDF, currentY: number, needH: number): boolean {
-  if (currentY + needH > PH - MB) { pdf.addPage(); return false }
-  return true
+function esc(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
 function fmtN(n: number | undefined): string {
@@ -558,40 +437,8 @@ function formatDate(ds: string): string {
   } catch { return ds }
 }
 
-function confLabel(c: string): string {
-  return c === 'high' ? '高置信度' : c === 'medium' ? '中等置信度' : '参考性质'
-}
+// ============ 收集图表元素 ============
 
-function simpleTable(pdf: jsPDF, data: string[][], startY: number): number {
-  const colWs = [CW * 0.3, CW * 0.3, CW * 0.4]
-  const cellH = 9
-  let y = startY
-
-  for (let r = 0; r < data.length; r++) {
-    const row = data[r]
-    fc(pdf, r % 2 === 0 ? 240 : 255, r % 2 === 0 ? 248 : 255, r % 2 === 0 ? 255 : 255)
-    pdf.rect(ML, y - cellH + 3, CW, cellH, 'F')
-
-    let x = ML + 4
-    for (let c = 0; c < row.length; c++) {
-      if (r === 0) {
-        setCN(pdf, 'bold'); tc(pdf, 30, 41, 59)
-      } else {
-        setCN(pdf, 'normal')
-        tc(pdf, c === 2 ? 100 : 30, c === 2 ? 116 : 41, c === 2 ? 139 : 59)
-      }
-      pdf.setFontSize(9)
-      pdf.text(row[c], x, y)
-      x += colWs[c]
-    }
-    y += cellH
-  }
-  return y
-}
-
-/**
- * 收集页面中所有 ECharts 图表容器的 DOM 元素
- */
 export function collectChartElements(): HTMLDivElement[] {
   const els: HTMLDivElement[] = []
   document.querySelectorAll('.echarts-container').forEach(el => {
