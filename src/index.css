@@ -53,3 +53,14 @@ body {
 .gradient-bg {
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
 }
+
+/* 隐藏 EdgeOne Pages 免费子域名的底部安全提示横幅 */
+body > iframe[src*="edgeone"],
+body > div:not([id="root"]) {
+  display: none !important;
+  visibility: hidden !important;
+  height: 0 !important;
+  width: 0 !important;
+  overflow: hidden !important;
+  pointer-events: none !important;
+}
