@@ -328,19 +328,23 @@ function buildSummaryHTML(r: AnalysisResult): string {
   const dc = r.columns.filter(c => c.type === 'date').length
   desc += `字段类型分布：${nc} 个数值型、${sc} 个文本型、${dc} 个日期型。`
 
-  let findings = ''
+  let conclusion = ''
   if (r.insights.length > 0) {
-    findings = `<p class="desc" style="margin-top:12px; font-weight:600; color:#1e293b;">核心发现</p>`
-    for (const ins of r.insights.slice(0, 8)) {
-      const c = INSIGHT_COLORS[ins.type] || '#3b82f6'
-      const label = INSIGHT_LABELS[ins.type] || '信息'
-      findings += `
-<div style="display:flex;align-items:flex-start;gap:8px;margin:6px 0 6px 4px;font-size:12px;line-height:1.6;">
-  <span style="display:inline-block;min-width:8px;height:8px;border-radius:50%;background:${c};flex-shrink:0;margin-top:6px;"></span>
-  <span style="display:inline-block;background:${c};color:#fff;font-size:10px;font-weight:600;padding:1px 8px;border-radius:9px;flex-shrink:0;margin-top:3px;">${esc(label)}</span>
-  <span style="color:#475569;flex:1;">${esc(ins.title)} — ${esc(ins.content.slice(0, 80))}${ins.content.length > 80 ? '…' : ''}</span>
-</div>`
-    }
+    const pos = r.insights.filter(i => i.type === 'positive').length
+    const neg = r.insights.filter(i => i.type === 'negative').length
+    const top = r.insights.slice(0, 2)
+    const hint = top.map(t => t.title).join('、')
+    conclusion = `<p style="margin-top:12px; padding:10px 14px; background:#f8fafc; border-radius:6px; color:#334155; font-size:12px; line-height:1.8;">`
+    conclusion += `<strong>核心结论：</strong>本次分析共生成 ${r.insights.length} 条洞察`
+    if (pos > 0 || neg > 0) conclusion += `（${pos > 0 ? `优势 ${pos} 条` : ''}${pos > 0 && neg > 0 ? '、' : ''}${neg > 0 ? `风险 ${neg} 条` : ''}）`
+    conclusion += `。关键发现包括：${esc(hint)}。`
+    if (neg > 0) conclusion += `建议优先关注风险项，结合业务背景排查。`
+    else if (pos > 0) conclusion += `可围绕优势项制定业务优化策略。`
+    conclusion += `</p>`
+  } else {
+    conclusion = `<p style="margin-top:12px; padding:10px 14px; background:#f8fafc; border-radius:6px; color:#334155; font-size:12px; line-height:1.8;">`
+    conclusion += `<strong>核心结论：</strong>本次分析完成数据结构与质量评估，未生成深度洞察。建议上传更完整的数据或补充更多维度的字段。`
+    conclusion += `</p>`
   }
 
   return `
@@ -353,7 +357,7 @@ function buildSummaryHTML(r: AnalysisResult): string {
     </div>
   `).join('')}
 </div>
-${findings}`
+${conclusion}`
 }
 
 // ==================== 数据概览 ====================
