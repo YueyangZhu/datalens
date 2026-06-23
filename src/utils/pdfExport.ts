@@ -197,10 +197,10 @@ td { padding: 6px 10px; border-bottom: 1px solid #f1f5f9; color: #334155; }
 tr:nth-child(even) td { background: #f8fafc; }
 
 /* 图表块 */
-.chart-block { margin: 16px 0; padding: 14px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; }
+.chart-block { margin: 16px 0; padding: 14px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; page-break-inside: avoid; break-inside: avoid; }
 .chart-block h3 { font-size: 14px; font-weight: 700; color: #1e293b; margin-bottom: 6px; }
 .chart-block .desc { font-size: 11px; color: #64748b; margin-bottom: 8px; }
-.chart-block img { width: 100%; max-width: 100%; border-radius: 4px; border: 1px solid #e2e8f0; display: block; }
+.chart-block img { width: 100%; max-width: 100%; max-height: 280px; object-fit: contain; border-radius: 4px; border: 1px solid #e2e8f0; display: block; }
 .chart-block .analysis { font-size: 11px; color: #475569; margin-top: 10px; line-height: 1.7; padding: 10px 12px; background: #fff; border-radius: 4px; border-left: 3px solid #2563eb; }
 .chart-empty { background: #f8fafc; border: 1px dashed #e2e8f0; border-radius: 4px; text-align: center; padding: 30px 0; color: #94a3b8; font-size: 12px; }
 
