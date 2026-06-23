@@ -1,6 +1,6 @@
 // 主应用组件
 
-import { useState, useCallback, useRef } from 'react'
+import { useState, useCallback } from 'react'
 import FileUpload from './components/FileUpload'
 import DataOverview from './components/DataOverview'
 import ChartDisplay from './components/ChartDisplay'
@@ -8,7 +8,7 @@ import InsightReport from './components/InsightReport'
 import ColumnDetails from './components/ColumnDetails'
 import { analyzeData } from './utils/dataAnalyzer'
 import { saveToHistory, getHistory, formatTime, clearHistory } from './utils/history'
-import { exportElementToPDF } from './utils/pdfExport'
+import { exportToPDFReport, collectChartElements } from './utils/pdfExport'
 import type { DataTable, AnalysisResult, HistoryRecord } from './types'
 
 type View = 'home' | 'analyzing' | 'result' | 'history'
@@ -19,7 +19,6 @@ export default function App() {
   const [result, setResult] = useState<AnalysisResult | null>(null)
   const [history, setHistory] = useState<HistoryRecord[]>([])
   const [exporting, setExporting] = useState(false)
-  const resultRef = useRef<HTMLDivElement>(null)
 
   // 处理文件上传完成
   const handleFileLoaded = useCallback((data: DataTable) => {
@@ -67,10 +66,13 @@ export default function App() {
 
   // 导出PDF
   const handleExportPDF = useCallback(async () => {
-    if (!resultRef.current || !result) return
+    if (!result) return
     setExporting(true)
     try {
-      await exportElementToPDF(resultRef.current, result.fileName)
+      // 收集所有ECharts图表DOM元素用于截图
+      const chartElements = collectChartElements()
+      // 调用专业报告生成函数
+      await exportToPDFReport(result, chartElements)
     } catch (e) {
       setError(`导出失败：${e instanceof Error ? e.message : '未知错误'}`)
       setTimeout(() => setError(''), 5000)
@@ -207,7 +209,7 @@ export default function App() {
 
         {/* 分析结果 */}
         {view === 'result' && result && (
-          <div ref={resultRef} className="space-y-8">
+          <div className="space-y-8">
             {/* 文件信息 */}
             <div className="flex items-center justify-between bg-white rounded-xl border border-slate-200 px-6 py-4 fade-in">
               <div className="flex items-center gap-3">

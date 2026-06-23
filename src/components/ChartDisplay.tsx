@@ -28,11 +28,13 @@ export default function ChartDisplay({ charts }: ChartDisplayProps) {
               <h4 className="text-sm font-semibold text-slate-700">{chart.title}</h4>
               <p className="text-xs text-slate-400 mt-0.5">{chart.description}</p>
             </div>
-            <ReactECharts
-              option={chart.option}
-              style={{ height: '300px', width: '100%' }}
-              opts={{ renderer: 'canvas' }}
-            />
+            <div className="echarts-container">
+              <ReactECharts
+                option={chart.option}
+                style={{ height: '300px', width: '100%' }}
+                opts={{ renderer: 'canvas' }}
+              />
+            </div>
           </div>
         ))}
       </div>
