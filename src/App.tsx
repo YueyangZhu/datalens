@@ -74,7 +74,16 @@ export default function App() {
       // 调用专业报告生成函数
       await exportToPDFReport(result, chartElements)
     } catch (e) {
-      setError(`导出失败：${e instanceof Error ? e.message : '未知错误'}`)
+      const raw = e instanceof Error ? e.message : String(e)
+      let msg = raw
+      if (raw.includes('drawImage') || raw.includes('width or height') || raw.includes('截图')) {
+        msg = '图表截图失败，请尝试放大浏览器窗口后重试。'
+      } else if (raw.includes('报告渲染失败')) {
+        msg = '报告渲染失败，请刷新页面后重试。'
+      } else if (raw.includes('network') || raw.includes('fetch')) {
+        msg = '资源加载失败，请检查网络后重试。'
+      }
+      setError(`导出失败：${msg}`)
       setTimeout(() => setError(''), 5000)
     } finally {
       setExporting(false)

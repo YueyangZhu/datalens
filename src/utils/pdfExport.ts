@@ -9,6 +9,7 @@
 
 import jsPDF from 'jspdf'
 import html2canvas from 'html2canvas'
+import * as echarts from 'echarts'
 import type { AnalysisResult } from '../types'
 
 // ============ 常量 ============
@@ -40,25 +41,28 @@ export async function exportToPDFReport(
   // Step 2: 生成报告 HTML
   const html = buildReportHTML(result, chartImages)
 
-  // Step 3: 创建隐藏容器
+  // Step 3: 创建隐藏容器（fixed定位+透明度，保持布局参与）
   const id = 'datalens-report-' + Date.now()
   const container = document.createElement('div')
   container.id = id
   container.innerHTML = html
   container.style.cssText = `
-    visibility: hidden;
-    position: absolute;
+    position: fixed;
     top: 0;
-    left: 0;
+    left: -9999px;
     width: ${REPORT_WIDTH}px;
     height: auto;
     z-index: -1;
     pointer-events: none;
+    opacity: 0;
     overflow: hidden;
   `
   document.body.appendChild(container)
 
-  // Step 4: html2canvas 截图（在克隆文档中将容器设为可见）
+  // 强制布局计算，确保子元素获得尺寸
+  container.getBoundingClientRect()
+
+  // Step 4: html2canvas 截图（在克隆文档中将容器移到可视区域）
   const fullCanvas = await html2canvas(container, {
     scale: SCALE,
     backgroundColor: '#ffffff',
@@ -70,7 +74,7 @@ export async function exportToPDFReport(
     onclone: (clonedDoc) => {
       const el = clonedDoc.getElementById(id)
       if (el) {
-        el.style.visibility = 'visible'
+        el.style.opacity = '1'
         el.style.position = 'relative'
         el.style.left = '0'
         el.style.top = '0'
@@ -82,6 +86,10 @@ export async function exportToPDFReport(
   // Step 5: 清理原始 DOM
   if (document.body.contains(container)) {
     document.body.removeChild(container)
+  }
+
+  if (fullCanvas.width === 0 || fullCanvas.height === 0) {
+    throw new Error('报告渲染失败：截图宽度或高度为 0，请尝试刷新页面后重试。')
   }
 
   // Step 6: 按 A4 高度裁切成页
@@ -122,11 +130,51 @@ async function captureChartImages(chartElements: HTMLDivElement[]): Promise<stri
   const images: string[] = []
   for (const el of chartElements) {
     try {
-      if (el.offsetHeight === 0) { images.push(''); continue }
-      const cvs = await html2canvas(el, { scale: 2, useCORS: true, backgroundColor: '#ffffff', logging: false })
+      // 检查容器本身尺寸
+      if (el.offsetWidth === 0 || el.offsetHeight === 0) {
+        images.push('')
+        continue
+      }
+
+      // 检查内部 canvas 尺寸
+      const innerCanvas = el.querySelector('canvas')
+      if (innerCanvas && (innerCanvas.width === 0 || innerCanvas.height === 0)) {
+        images.push('')
+        continue
+      }
+
+      // 优先使用 ECharts 原生 getDataURL，清晰且稳定
+      const chartInstance = echarts.getInstanceByDom(el)
+      if (chartInstance) {
+        try {
+          const dataUrl = chartInstance.getDataURL({
+            type: 'png',
+            pixelRatio: 2,
+            backgroundColor: '#ffffff',
+          })
+          images.push(dataUrl)
+          continue
+        } catch {
+          // 回退到 html2canvas
+        }
+      }
+
+      // 回退：html2canvas 直接截图容器
+      const cvs = await html2canvas(el, {
+        scale: 2,
+        useCORS: true,
+        backgroundColor: '#ffffff',
+        logging: false,
+      })
+      if (cvs.width === 0 || cvs.height === 0) {
+        images.push('')
+        continue
+      }
       images.push(cvs.toDataURL('image/png', 0.92))
-    } catch {
+    } catch (e) {
+      // 单个图表失败不中断整体导出
       images.push('')
+      console.warn('[PDF导出] 图表截图失败:', e)
     }
   }
   return images
@@ -537,12 +585,15 @@ function formatDate(ds: string): string {
 
 export function collectChartElements(): HTMLDivElement[] {
   const els: HTMLDivElement[] = []
-  document.querySelectorAll('.echarts-container').forEach(el => {
-    if (el instanceof HTMLDivElement && el.offsetWidth > 0) els.push(el)
-  })
-  if (els.length === 0) {
-    document.querySelectorAll('.echarts-for-react').forEach(el => {
-      if (el instanceof HTMLDivElement && el.offsetWidth > 0) els.push(el)
+  const selectors = ['.echarts-container', '.echarts-for-react']
+  for (const sel of selectors) {
+    document.querySelectorAll(sel).forEach(el => {
+      if (el instanceof HTMLDivElement && el.offsetWidth > 0 && el.offsetHeight > 0) {
+        // 再检查内部 canvas 是否有效
+        const canvas = el.querySelector('canvas')
+        if (canvas && (canvas.width === 0 || canvas.height === 0)) return
+        els.push(el)
+      }
     })
   }
   return els
