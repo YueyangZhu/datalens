@@ -1,11 +1,6 @@
-// PDF导出工具 - html2canvas onclone 方案
-// 流程：ECharts截图 → 生成报告HTML → 隐藏DOM中渲染 → html2canvas onclone截图 → jsPDF拼页 → 自动下载PDF
-// 优点：无弹窗、无新页签、中文原生渲染、输出真实PDF文件
-//
-// A4 尺寸：
-//   210mm × 297mm
-//   @96dpi ≈ 794px × 1122px
-//   scale=2 → 1588px × 2244px/页
+// PDF导出工具 - 可靠渲染方案
+// 流程：ECharts截图 → 生成报告HTML → CSS注入head → 离屏DOM渲染 → html2canvas截图 → jsPDF拼页 → 自动下载PDF
+// 关键修复：CSS注入document.head确保样式生效；fixed+left:-9999px离屏定位确保浏览器正常计算布局
 
 import jsPDF from 'jspdf'
 import html2canvas from 'html2canvas'
@@ -14,10 +9,10 @@ import type { AnalysisResult } from '../types'
 
 // ============ 常量 ============
 
-const REPORT_WIDTH = 794 // A4宽度像素
+const REPORT_WIDTH = 794 // A4宽度像素 @96dpi
 const PAGE_HEIGHT = 1122 // A4高度像素
 const SCALE = 2
-const PAD_MM = 10 // 报告边距 mm
+const PAD_MM = 10
 
 const TYPE_LABELS: Record<string, string> = {
   number: '数值型', string: '文本型', date: '日期型', boolean: '布尔型',
@@ -29,195 +24,33 @@ const INSIGHT_COLORS: Record<string, string> = {
   positive: '#16a34a', negative: '#ef4444', warning: '#f59e0b', info: '#3b82f6',
 }
 
-// ============ 主入口 ============
+// ============ 报告 CSS（独立常量，通过 injectReportCSS 注入 document.head）============
 
-export async function exportToPDFReport(
-  result: AnalysisResult,
-  chartElements?: HTMLDivElement[]
-): Promise<void> {
-  // Step 1: 截图图表
-  const chartImages = await captureChartImages(chartElements || [])
-
-  // Step 2: 生成报告 HTML
-  const html = buildReportHTML(result, chartImages)
-
-  // Step 3: 创建隐藏容器（fixed定位+透明度，保持布局参与）
-  const id = 'datalens-report-' + Date.now()
-  const container = document.createElement('div')
-  container.id = id
-  container.innerHTML = html
-  container.style.cssText = `
-    position: fixed;
-    top: 0;
-    left: -9999px;
-    width: ${REPORT_WIDTH}px;
-    height: auto;
-    z-index: -1;
-    pointer-events: none;
-    opacity: 0;
-    overflow: hidden;
-  `
-  document.body.appendChild(container)
-
-  // 强制布局计算，确保子元素获得尺寸
-  container.getBoundingClientRect()
-
-  // Step 4: html2canvas 截图（在克隆文档中将容器移到可视区域）
-  const fullCanvas = await html2canvas(container, {
-    scale: SCALE,
-    backgroundColor: '#ffffff',
-    logging: false,
-    useCORS: true,
-    allowTaint: true,
-    width: REPORT_WIDTH,
-    windowWidth: REPORT_WIDTH,
-    onclone: (clonedDoc) => {
-      const el = clonedDoc.getElementById(id)
-      if (el) {
-        el.style.opacity = '1'
-        el.style.position = 'relative'
-        el.style.left = '0'
-        el.style.top = '0'
-        el.style.zIndex = 'auto'
-      }
-    },
-  })
-
-  // Step 5: 清理原始 DOM
-  if (document.body.contains(container)) {
-    document.body.removeChild(container)
-  }
-
-  if (fullCanvas.width === 0 || fullCanvas.height === 0) {
-    throw new Error('报告渲染失败：截图宽度或高度为 0，请尝试刷新页面后重试。')
-  }
-
-  // Step 6: 按 A4 高度裁切成页
-  const pageH = PAGE_HEIGHT * SCALE
-  const totalPages = Math.max(1, Math.ceil(fullCanvas.height / pageH))
-  const pdf = new jsPDF('p', 'mm', 'a4')
-
-  for (let p = 0; p < totalPages; p++) {
-    if (p > 0) pdf.addPage()
-
-    const sy = p * pageH
-    const sh = Math.min(pageH, fullCanvas.height - sy)
-
-    const pageCanvas = document.createElement('canvas')
-    pageCanvas.width = fullCanvas.width
-    pageCanvas.height = sh
-
-    const ctx = pageCanvas.getContext('2d')
-    if (!ctx) continue
-
-    ctx.fillStyle = '#ffffff'
-    ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height)
-    ctx.drawImage(fullCanvas, 0, sy, fullCanvas.width, sh, 0, 0, fullCanvas.width, sh)
-
-    const dataUrl = pageCanvas.toDataURL('image/png', 0.95)
-    const drawHeight = (sh / fullCanvas.width) * 210 // mm
-    pdf.addImage(dataUrl, 'PNG', 0, 0, 210, drawHeight)
-  }
-
-  // Step 7: 下载 PDF
-  const safeName = result.fileName.replace(/[^\w\u4e00-\u9fa5.-]/g, '_')
-  pdf.save(`${safeName}_数据分析报告.pdf`)
-}
-
-// ============ 图表截图 ============
-
-async function captureChartImages(chartElements: HTMLDivElement[]): Promise<string[]> {
-  const images: string[] = []
-  for (const el of chartElements) {
-    try {
-      // 检查容器本身尺寸
-      if (el.offsetWidth === 0 || el.offsetHeight === 0) {
-        images.push('')
-        continue
-      }
-
-      // 检查内部 canvas 尺寸
-      const innerCanvas = el.querySelector('canvas')
-      if (innerCanvas && (innerCanvas.width === 0 || innerCanvas.height === 0)) {
-        images.push('')
-        continue
-      }
-
-      // 优先使用 ECharts 原生 getDataURL，清晰且稳定
-      const chartInstance = echarts.getInstanceByDom(el)
-      if (chartInstance) {
-        try {
-          const dataUrl = chartInstance.getDataURL({
-            type: 'png',
-            pixelRatio: 2,
-            backgroundColor: '#ffffff',
-          })
-          images.push(dataUrl)
-          continue
-        } catch {
-          // 回退到 html2canvas
-        }
-      }
-
-      // 回退：html2canvas 直接截图容器
-      const cvs = await html2canvas(el, {
-        scale: 2,
-        useCORS: true,
-        backgroundColor: '#ffffff',
-        logging: false,
-      })
-      if (cvs.width === 0 || cvs.height === 0) {
-        images.push('')
-        continue
-      }
-      images.push(cvs.toDataURL('image/png', 0.92))
-    } catch (e) {
-      // 单个图表失败不中断整体导出
-      images.push('')
-      console.warn('[PDF导出] 图表截图失败:', e)
-    }
-  }
-  return images
-}
-
-// ============ 报告 HTML 生成 ============
-
-function buildReportHTML(r: AnalysisResult, chartImages: string[]): string {
-  const now = new Date().toLocaleString('zh-CN')
-  const padCSS = `${PAD_MM}mm`
-
-  return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DataLens 数据分析报告</title>
-<style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-
-  body {
+function getReportCSS(): string {
+  const pad = PAD_MM + 'mm'
+  return `
+  .report-body {
     font-family: -apple-system,'Microsoft YaHei','PingFang SC','Noto Sans SC',sans-serif;
     color: #1e293b; font-size: 13px; line-height: 1.75;
     -webkit-font-smoothing: antialiased;
+    box-sizing: border-box;
   }
+  .report-body * { margin:0; padding:0; box-sizing:border-box; }
 
   .page {
-    width: 210mm;
-    min-height: 297mm;
-    padding: ${padCSS};
+    width: 794px;
+    min-height: 1122px;
+    padding: ${pad};
     background: #fff;
-    page-break-after: always;
     position: relative;
     overflow: hidden;
   }
-  .page:last-child { page-break-after: auto; }
 
-  /* 封面 */
   .cover {
     background: linear-gradient(145deg, #1d4ed8, #2563eb 50%, #3b82f6);
-    color: #fff; min-height: 297mm;
+    color: #fff; min-height: 1122px;
     display: flex; flex-direction: column; justify-content: center;
-    padding: 10vh ${padCSS};
+    padding: 100px ${pad};
     position: relative;
   }
   .cover-stripe {
@@ -228,7 +61,7 @@ function buildReportHTML(r: AnalysisResult, chartImages: string[]): string {
   .cover-meta { font-size: 15px; opacity: 0.82; line-height: 2.3; }
   .cover-meta em { font-style: normal; opacity: 0.6; display: inline-block; width: 80px; }
   .cover-bottom {
-    position: absolute; bottom: 10vh; left: ${padCSS}; right: ${padCSS};
+    position: absolute; bottom: 10vh; left: ${pad}; right: ${pad};
     text-align: center; font-size: 11px; opacity: 0.45;
   }
 
@@ -299,18 +132,209 @@ function buildReportHTML(r: AnalysisResult, chartImages: string[]): string {
   .footer-section { margin-top: 30px; }
   .footer-section p { font-size: 12px; color: #94a3b8; line-height: 2; margin: 4px 0; }
   .footer-section strong { color: #64748b; }
-</style>
-</head>
-<body>
-  ${buildCoverHTML(r, now, padCSS)}
+`
+}
+
+// ============ 主入口 ============
+
+export async function exportToPDFReport(
+  result: AnalysisResult,
+  chartElements?: HTMLDivElement[]
+): Promise<void> {
+  // Step 1: 截图图表
+  const chartImages = await captureChartImages(chartElements || [])
+
+  // Step 2: 注入报告 CSS 到 document.head
+  const styleId = 'datalens-pdf-style-' + Date.now()
+  injectReportCSS(styleId)
+
+  // Step 3: 生成报告 HTML（不再包含 <style> 标签）
+  const html = buildReportHTML(result, chartImages)
+
+  // Step 4: 创建离屏容器（left:-9999px 确保浏览器正常计算布局）
+  const containerId = 'datalens-report-' + Date.now()
+  const container = document.createElement('div')
+  container.id = containerId
+  container.innerHTML = html
+  container.style.cssText = `
+    position: fixed;
+    left: -9999px;
+    top: 0;
+    width: ${REPORT_WIDTH}px;
+    height: auto;
+  `
+  document.body.appendChild(container)
+
+  // 强制回流：连续两个 requestAnimationFrame 确保浏览器已完成所有布局计算
+  await new Promise<void>((resolve) => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        // 读取 offsetHeight 强制同步布局
+        void container.offsetHeight
+        resolve()
+      })
+    })
+  })
+
+  // 调试日志
+  const rect = container.getBoundingClientRect()
+  console.log('[PDF导出] 容器尺寸:', rect.width, 'x', rect.height, 'scrollHeight:', container.scrollHeight)
+
+  // Step 5: html2canvas 截图
+  let fullCanvas: HTMLCanvasElement
+  try {
+    fullCanvas = await html2canvas(container, {
+      scale: SCALE,
+      backgroundColor: '#ffffff',
+      logging: false,
+      useCORS: true,
+      allowTaint: true,
+      width: REPORT_WIDTH,
+      windowWidth: REPORT_WIDTH,
+      onclone: (clonedDoc) => {
+        // 在克隆文档中将容器移到可视区域（left:0）以便正确截图
+        const el = clonedDoc.getElementById(containerId)
+        if (el) {
+          el.style.left = '0'
+          el.style.top = '0'
+        }
+      },
+    })
+  } catch (err) {
+    console.error('[PDF导出] html2canvas 截图失败:', err)
+    throw new Error('报告渲染失败：' + (err instanceof Error ? err.message : '截图异常'))
+  } finally {
+    // 清理 DOM
+    if (document.body.contains(container)) {
+      document.body.removeChild(container)
+    }
+    removeReportCSS(styleId)
+  }
+
+  if (fullCanvas.width === 0 || fullCanvas.height === 0) {
+    throw new Error('报告渲染失败：截图宽度或高度为 0，请刷新页面后重试')
+  }
+
+  // Step 6: 按 A4 高度裁切成页
+  const pageH = PAGE_HEIGHT * SCALE
+  const totalPages = Math.max(1, Math.ceil(fullCanvas.height / pageH))
+  const pdf = new jsPDF('p', 'mm', 'a4')
+
+  for (let p = 0; p < totalPages; p++) {
+    if (p > 0) pdf.addPage()
+
+    const sy = p * pageH
+    const sh = Math.min(pageH, fullCanvas.height - sy)
+
+    const pageCanvas = document.createElement('canvas')
+    pageCanvas.width = fullCanvas.width
+    pageCanvas.height = sh
+
+    const ctx = pageCanvas.getContext('2d')
+    if (!ctx) continue
+
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height)
+    ctx.drawImage(fullCanvas, 0, sy, fullCanvas.width, sh, 0, 0, fullCanvas.width, sh)
+
+    const dataUrl = pageCanvas.toDataURL('image/png', 0.95)
+    const drawHeight = (sh / fullCanvas.width) * 210 // mm
+    pdf.addImage(dataUrl, 'PNG', 0, 0, 210, drawHeight)
+  }
+
+  // Step 7: 下载 PDF
+  const safeName = result.fileName.replace(/[^\w\u4e00-\u9fa5.-]/g, '_')
+  pdf.save(`${safeName}_数据分析报告.pdf`)
+}
+
+// ============ CSS 注入/清理 ============
+
+function injectReportCSS(styleId: string): void {
+  if (document.getElementById(styleId)) return
+  const styleEl = document.createElement('style')
+  styleEl.id = styleId
+  styleEl.textContent = getReportCSS()
+  document.head.appendChild(styleEl)
+}
+
+function removeReportCSS(styleId: string): void {
+  const styleTag = document.getElementById(styleId)
+  if (styleTag) {
+    styleTag.remove()
+  }
+}
+
+// ============ 图表截图 ============
+
+async function captureChartImages(chartElements: HTMLDivElement[]): Promise<string[]> {
+  const images: string[] = []
+  for (const el of chartElements) {
+    try {
+      if (el.offsetWidth === 0 || el.offsetHeight === 0) {
+        console.warn('[PDF导出] 图表容器尺寸为 0，跳过:', el.className)
+        images.push('')
+        continue
+      }
+
+      const chartInstance = echarts.getInstanceByDom(el)
+      if (chartInstance) {
+        try {
+          const dataUrl = chartInstance.getDataURL({
+            type: 'png',
+            pixelRatio: 2,
+            backgroundColor: '#ffffff',
+          })
+          if (dataUrl && dataUrl.length > 100) {
+            images.push(dataUrl)
+            continue
+          }
+        } catch (e) {
+          console.warn('[PDF导出] ECharts getDataURL 失败，回退 html2canvas:', e)
+        }
+      }
+
+      const innerCanvas = el.querySelector('canvas')
+      if (innerCanvas && (innerCanvas.width === 0 || innerCanvas.height === 0)) {
+        console.warn('[PDF导出] 内部 canvas 尺寸为 0，跳过:', el.className)
+        images.push('')
+        continue
+      }
+
+      const cvs = await html2canvas(el, {
+        scale: 2,
+        useCORS: true,
+        backgroundColor: '#ffffff',
+        logging: false,
+      })
+      if (cvs.width === 0 || cvs.height === 0) {
+        images.push('')
+        continue
+      }
+      images.push(cvs.toDataURL('image/png', 0.92))
+    } catch (e) {
+      console.warn('[PDF导出] 图表截图失败:', e)
+      images.push('')
+    }
+  }
+  return images
+}
+
+// ============ 报告 HTML 生成（不再包含 <style> 标签，CSS 通过 injectReportCSS 注入）============
+
+function buildReportHTML(r: AnalysisResult, chartImages: string[]): string {
+  const now = new Date().toLocaleString('zh-CN')
+  const pad = PAD_MM + 'mm'
+
+  return `
+<div class="report-body">
+  ${buildCoverHTML(r, now, pad)}
   ${buildReportBody(r, chartImages)}
-</body>
-</html>`
+</div>`
 }
 
 // ==================== 封面 ====================
 
-function buildCoverHTML(r: AnalysisResult, now: string, padCSS: string): string {
+function buildCoverHTML(r: AnalysisResult, now: string, pad: string): string {
   return `
 <div class="page cover">
   <h1>DataLens</h1>
@@ -585,14 +609,20 @@ function formatDate(ds: string): string {
 
 export function collectChartElements(): HTMLDivElement[] {
   const els: HTMLDivElement[] = []
-  const selectors = ['.echarts-container', '.echarts-for-react']
-  for (const sel of selectors) {
-    document.querySelectorAll(sel).forEach(el => {
-      if (el instanceof HTMLDivElement && el.offsetWidth > 0 && el.offsetHeight > 0) {
-        // 再检查内部 canvas 是否有效
-        const canvas = el.querySelector('canvas')
+  document.querySelectorAll('.echarts-for-react').forEach(el => {
+    if (el instanceof HTMLDivElement && el.offsetWidth > 0 && el.offsetHeight > 0) {
+      const canvas = el.querySelector('canvas')
+      if (canvas && (canvas.width === 0 || canvas.height === 0)) return
+      els.push(el)
+    }
+  })
+  if (els.length === 0) {
+    document.querySelectorAll('.echarts-container').forEach(parent => {
+      const child = parent.querySelector('.echarts-for-react')
+      if (child instanceof HTMLDivElement && child.offsetWidth > 0 && child.offsetHeight > 0) {
+        const canvas = child.querySelector('canvas')
         if (canvas && (canvas.width === 0 || canvas.height === 0)) return
-        els.push(el)
+        els.push(child)
       }
     })
   }
