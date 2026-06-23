@@ -1,20 +1,14 @@
 // PDF导出工具 - 浏览器原生打印方案
-// 核心思路：iframe + window.print() → 浏览器"另存为PDF"
-// 优点：中文完美渲染、文字可搜索复制、排版所见即所得、零依赖
-//
-// A4尺寸对应：
-//   像素（@96dpi）: 794 × 1122
-//   毫米：210 × 297
+// 流程：ECharts截图 → 生成完整报告HTML → 新窗口打印 → "另存为PDF"
+// 中文由浏览器原生渲染，零乱码
 
 import type { AnalysisResult } from '../types'
 import html2canvas from 'html2canvas'
 
 // ============ 常量 ============
 
-/** A4 内容宽度（px @96dpi，减去边距） */
-const PAD = 40
+const PAD_MM = 10 // 页面边距 mm
 
-/** 中文标题映射 */
 const TYPE_LABELS: Record<string, string> = {
   number: '数值型', string: '文本型', date: '日期型', boolean: '布尔型',
 }
@@ -31,49 +25,50 @@ export async function exportToPDFReport(
   result: AnalysisResult,
   chartElements?: HTMLDivElement[]
 ): Promise<void> {
-  // 第1步：截图图表
+  // Step 1: 截图所有 ECharts 图表
   const chartImages = await captureChartImages(chartElements || [])
 
-  // 第2步：生成完整报告HTML（含打印CSS）
+  // Step 2: 生成完整报告 HTML
   const html = buildReportHTML(result, chartImages)
 
-  // 第3步：创建隐藏 iframe 并写入内容
-  const iframe = document.createElement('iframe')
-  iframe.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;border:none;z-index:99999;'
-  document.body.appendChild(iframe)
-
-  const doc = iframe.contentDocument || iframe.contentWindow!.document
-  doc.open()
-  doc.write(html)
-  doc.close()
-
-  // 第4步：等待图片和样式加载完毕
-  const imgs = doc.querySelectorAll('img')
-  await Promise.all(Array.from(imgs).map(
-    img => img.complete ? Promise.resolve() : new Promise<void>(r => { img.onload = () => r(); img.onerror = () => r() })
-  ))
-  await new Promise(r => setTimeout(r, 300))
-
-  // 第5步：触发打印
-  iframe.contentWindow!.focus()
-  iframe.contentWindow!.print()
-
-  // 第6步：等待打印对话框关闭后清理
-  // 通过监听 afterprint 事件清理
-  const cleanup = () => {
-    iframe.contentWindow!.removeEventListener('afterprint', cleanup)
-    if (document.body.contains(iframe)) {
-      document.body.removeChild(iframe)
-    }
+  // Step 3: 打开新窗口写入报告 → 打印
+  const pw = window.open('', '_blank')
+  if (!pw) {
+    // Popup 被拦截 → 备用方案：下载 HTML 文件
+    downloadBlob(html, `${result.fileName}_数据分析报告.html`)
+    alert('导出窗口被拦截。已下载报告文件，请双击打开后按 Ctrl+P 保存为 PDF。')
+    return
   }
-  iframe.contentWindow!.addEventListener('afterprint', cleanup)
 
-  // 兜底：10秒后强制清理（防止 afterprint 不触发）
-  setTimeout(() => {
-    if (document.body.contains(iframe)) {
-      document.body.removeChild(iframe)
-    }
-  }, 10000)
+  pw.document.write(html)
+  pw.document.close()
+
+  // 等待渲染完成
+  await new Promise<void>(resolve => {
+    pw.addEventListener('load', () => setTimeout(resolve, 600), { once: true })
+  })
+
+  // 打印（用户选择"另存为PDF"）
+  pw.print()
+
+  // 打印对话框关闭后自动关窗
+  pw.addEventListener('afterprint', () => pw.close(), { once: true })
+  // 30秒兜底
+  setTimeout(() => { try { pw.close() } catch {} }, 30000)
+}
+
+// ============ 备用下载 ============
+
+function downloadBlob(html: string, filename: string) {
+  const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
 }
 
 // ============ 图表截图 ============
@@ -82,9 +77,9 @@ async function captureChartImages(chartElements: HTMLDivElement[]): Promise<stri
   const images: string[] = []
   for (const el of chartElements) {
     try {
-      if (el.offsetWidth === 0) { images.push(''); continue }
+      if (el.offsetHeight === 0) { images.push(''); continue }
       const cvs = await html2canvas(el, { scale: 2, useCORS: true, backgroundColor: '#ffffff', logging: false })
-      images.push(cvs.toDataURL('image/png', 0.9))
+      images.push(cvs.toDataURL('image/png', 0.92))
     } catch {
       images.push('')
     }
@@ -92,286 +87,212 @@ async function captureChartImages(chartElements: HTMLDivElement[]): Promise<stri
   return images
 }
 
-// ============ HTML 报告生成 ============
+// ============ 报告HTML生成 ============
 
-function buildReportHTML(result: AnalysisResult, chartImages: string[]): string {
+function buildReportHTML(r: AnalysisResult, chartImages: string[]): string {
   const now = new Date().toLocaleString('zh-CN')
+  const padCSS = `${PAD_MM}mm`
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DataLens - 数据分析报告</title>
+<title>DataLens 数据分析报告</title>
 <style>
-  @page {
-    size: A4;
-    margin: 0;
-  }
+  @page { size: A4; margin: ${padCSS}; }
+  @page cover { margin: 0; }
 
-  * { margin: 0; padding: 0; box-sizing: border-box; }
+  * { margin:0; padding:0; box-sizing:border-box; }
 
   body {
-    font-family: -apple-system, 'Microsoft YaHei', 'PingFang SC', 'Noto Sans SC', sans-serif;
-    color: #1e293b;
-    font-size: 14px;
-    line-height: 1.7;
+    font-family: -apple-system,'Microsoft YaHei','PingFang SC','Noto Sans SC',sans-serif;
+    color: #1e293b; font-size: 13px; line-height: 1.75;
     -webkit-print-color-adjust: exact;
     print-color-adjust: exact;
+    -webkit-font-smoothing: antialiased;
   }
 
-  /* 每页 210mm × 297mm */
-  .page {
-    width: 210mm;
-    min-height: 297mm;
-    padding: 15mm ${PAD / 96 * 25.4}mm;
-    page-break-after: always;
-    position: relative;
-    overflow: hidden;
-  }
-  .page:last-child { page-break-after: auto; }
-
-  .page-footer {
-    position: absolute;
-    bottom: 12mm;
-    left: ${PAD / 96 * 25.4}mm;
-    right: ${PAD / 96 * 25.4}mm;
-    border-top: 1px solid #e2e8f0;
-    padding-top: 6mm;
-    text-align: center;
-    font-size: 10px;
-    color: #94a3b8;
-  }
-
-  /* ===== 封面 ===== */
+  /* 封面 */
   .cover {
-    background: linear-gradient(135deg, #1d4ed8 0%, #2563eb 50%, #3b82f6 100%);
-    color: #fff;
-    height: 297mm;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    position: relative;
-    padding: 0 ${PAD / 96 * 25.4}mm;
+    page: cover;
+    background: linear-gradient(145deg, #1d4ed8, #2563eb 50%, #3b82f6);
+    color: #fff; min-height: 100vh; display:flex; flex-direction:column;
+    justify-content:center; padding: 10vw ${padCSS}; position:relative;
+    page-break-after: always;
   }
-  .cover-accent {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    height: 5px;
-    background: #f59e0b;
+  .cover-stripe {
+    position: absolute; bottom:0; left:0; right:0; height:5px; background:#f59e0b;
   }
   .cover h1 {
-    font-size: 48px;
-    font-weight: 800;
-    letter-spacing: 2px;
-    margin-bottom: 16px;
+    font-size: 52px; font-weight:800; letter-spacing:2px; margin-bottom:12px;
   }
   .cover h2 {
-    font-size: 22px;
-    font-weight: 400;
-    opacity: 0.9;
-    margin-bottom: 60px;
+    font-size: 22px; font-weight:400; opacity:.88; margin-bottom:56px;
   }
   .cover-meta {
-    font-size: 15px;
-    opacity: 0.85;
-    line-height: 2.2;
+    font-size:15px; opacity:.82; line-height:2.3;
   }
-  .cover-meta span.ml { display: inline-block; width: 90px; opacity: 0.7; }
+  .cover-meta em { font-style:normal; opacity:.6; display:inline-block; width:80px; }
   .cover-bottom {
-    position: absolute;
-    bottom: 30mm;
-    left: ${PAD / 96 * 25.4}mm;
-    right: ${PAD / 96 * 25.4}mm;
-    text-align: center;
-    font-size: 12px;
-    opacity: 0.5;
+    position: absolute; bottom: 10vh; left:${padCSS}; right:${padCSS};
+    text-align:center; font-size:11px; opacity:.45;
   }
 
-  /* ===== 章节 ===== */
-  .section { margin-bottom: 20mm; }
+  /* 章节 */
+  .section { margin-bottom: 36px; page-break-after: always; }
+  .section:last-of-type { page-break-after: auto; }
   .section-title {
-    font-size: 22px;
-    font-weight: 700;
-    color: #2563eb;
-    padding-left: 12px;
-    border-left: 4px solid #2563eb;
-    margin-bottom: 16px;
-    line-height: 1.3;
+    font-size: 20px; font-weight:700; color:#2563eb; padding-left:12px;
+    border-left: 4px solid #2563eb; margin-bottom: 16px;
   }
 
-  /* ===== 卡片 ===== */
-  .card-row {
-    display: flex;
-    gap: 14px;
-    margin: 14px 0;
-  }
+  /* 描述段落 */
+  .desc { font-size: 13px; color: #64748b; margin-bottom: 16px; }
+
+  /* 指标卡片 */
+  .cards { display:flex; gap:12px; margin:12px 0; }
   .card {
-    flex: 1;
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: 8px;
-    padding: 20px 14px;
-    text-align: center;
+    flex:1; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px;
+    padding:18px 14px; text-align:center;
   }
-  .card-value {
-    font-size: 28px;
-    font-weight: 700;
-  }
-  .card-label {
-    font-size: 12px;
-    color: #64748b;
-    margin-top: 6px;
+  .card-val { font-size: 26px; font-weight:700; }
+  .card-lbl { font-size: 12px; color:#64748b; margin-top:4px; }
+
+  /* 表格 */
+  table { width:100%; border-collapse:collapse; margin:10px 0 20px 0; }
+  th { background:#eff6ff; color:#1e40af; font-size:12px; font-weight:600;
+       padding:10px 12px; text-align:left; border-bottom:2px solid #bfdbfe; }
+  td { padding:8px 12px; font-size:12px; border-bottom:1px solid #f1f5f9; color:#334155; }
+  tr:nth-child(even) td { background:#f8fafc; }
+  td.tp { color:#3b82f6; }
+  td.assess { color:#64748b; }
+
+  /* 图表块 */
+  .chart-box { margin:18px 0; }
+  .chart-box h3 { font-size:15px; font-weight:700; color:#1e293b; margin-bottom:4px; }
+  .chart-box .desc { font-size:12px; color:#64748b; margin-bottom:10px; }
+  .chart-box img { width:100%; border-radius:6px; border:1px solid #f1f5f9; }
+  .chart-empty {
+    background:#f8fafc; border:1px dashed #e2e8f0; border-radius:6px;
+    text-align:center; padding:44px 0; color:#94a3b8; font-size:13px;
   }
 
-  /* ===== 表格 ===== */
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    margin: 12px 0;
-  }
-  th {
-    background: #eff6ff;
-    color: #1e40af;
-    font-size: 13px;
-    font-weight: 600;
-    padding: 10px 12px;
-    text-align: left;
-    border-bottom: 2px solid #bfdbfe;
-  }
-  td {
-    padding: 9px 12px;
-    font-size: 13px;
-    border-bottom: 1px solid #f1f5f9;
-    color: #334155;
-  }
-  tr:nth-child(even) td { background: #f8fafc; }
-  td.type { color: #3b82f6; }
-
-  /* ===== 图表 ===== */
-  .chart-box { margin: 16px 0; }
-  .chart-box h3 { font-size: 16px; font-weight: 700; color: #1e293b; margin-bottom: 4px; }
-  .chart-box .desc { font-size: 12px; color: #64748b; margin-bottom: 10px; line-height: 1.6; }
-  .chart-box img {
-    width: 100%;
-    max-width: 100%;
-    border-radius: 6px;
-    border: 1px solid #f1f5f9;
-  }
-  .chart-box .chart-empty {
-    background: #f8fafc;
-    border: 1px dashed #e2e8f0;
-    border-radius: 6px;
-    text-align: center;
-    padding: 48px 0;
-    color: #94a3b8;
-    font-size: 13px;
-  }
-
-  /* ===== 洞察卡片 ===== */
+  /* 洞察统计条 */
   .insight-stats {
-    background: #f8fafc;
-    border-radius: 8px;
-    padding: 12px 16px;
-    margin-bottom: 16px;
+    background:#f8fafc; border-radius:8px; padding:10px 16px; margin-bottom:16px;
   }
-  .insight-stats span { margin-right: 18px; font-size: 13px; font-weight: 600; }
-  .insight-card {
-    background: #fff;
-    border: 1px solid #e2e8f0;
-    border-radius: 8px;
-    margin: 10px 0;
-    overflow: hidden;
-    display: flex;
-  }
-  .insight-bar { width: 5px; flex-shrink: 0; }
-  .insight-body { flex: 1; padding: 14px 16px; }
-  .insight-num {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    border-radius: 50%;
-    color: #fff;
-    font-size: 12px;
-    font-weight: 700;
-    flex-shrink: 0;
-    margin-right: 6px;
-  }
-  .insight-title { font-size: 15px; font-weight: 700; display: inline; vertical-align: middle; }
-  .insight-meta { display: flex; gap: 12px; align-items: center; margin: 6px 0; }
-  .insight-badge {
-    display: inline-block;
-    padding: 1px 9px;
-    border-radius: 10px;
-    font-size: 11px;
-    font-weight: 600;
-    color: #fff;
-    opacity: 0.9;
-  }
-  .insight-conf { font-size: 11px; color: #94a3b8; }
-  .insight-content { font-size: 13px; color: #475569; line-height: 1.7; }
+  .insight-stats span { margin-right:16px; font-size:12px; font-weight:600; }
 
-  /* ===== 声明 ===== */
-  .disclaimer { font-size: 12px; color: #94a3b8; line-height: 2; margin-top: 20mm; }
-  .disclaimer strong { color: #64748b; }
+  /* 洞察卡片 */
+  .ins-card {
+    background:#fff; border:1px solid #e2e8f0; border-radius:8px;
+    margin:10px 0; display:flex; overflow:hidden;
+  }
+  .ins-bar { width:5px; flex-shrink:0; }
+  .ins-body { flex:1; padding:14px 16px; }
+  .ins-hdr { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
+  .ins-hdr .num {
+    display:inline-flex; align-items:center; justify-content:center;
+    width:24px; height:24px; border-radius:50%; color:#fff; font-size:11px;
+    font-weight:700; flex-shrink:0;
+  }
+  .ins-hdr .title { font-size:14px; font-weight:700; }
+  .ins-meta { display:flex; gap:10px; align-items:center; margin:6px 0; }
+  .ins-meta .badge {
+    display:inline-block; padding:1px 8px; border-radius:10px;
+    font-size:10px; font-weight:600; color:#fff; opacity:.88;
+  }
+  .ins-meta .conf { font-size:11px; color:#94a3b8; }
+  .ins-body .body { font-size:12px; color:#475569; line-height:1.75; }
+
+  /* 声明 */
+  .footer-section { margin-top: 60px; }
+  .footer-section p { font-size:12px; color:#94a3b8; line-height:2; margin:4px 0; }
+  .footer-section strong { color:#64748b; }
+
+  /* 总结块 */
+  .summary-block {
+    background: linear-gradient(135deg, #eff6ff, #f0f9ff);
+    border: 1px solid #bfdbfe;
+    border-radius: 8px;
+    padding: 16px 18px;
+    margin: 20px 0;
+    font-size: 13px;
+    line-height: 1.85;
+    color: #1e40af;
+  }
+  .summary-block strong { color: #1d4ed8; }
+
+  /* 打印分页优化 */
+  h3, h4, .cards, .chart-box { break-inside: avoid; }
+  tr { break-inside: avoid; }
 </style>
 </head>
 <body>
-${buildCoverHTML(result, now)}
-${buildContentHTML(result, chartImages, now)}
+  ${buildCoverHTML(r, now, padCSS)}
+  ${buildReportBody(r, chartImages)}
 </body>
 </html>`
 }
 
 // ==================== 封面 ====================
 
-function buildCoverHTML(r: AnalysisResult, now: string): string {
+function buildCoverHTML(r: AnalysisResult, now: string, padCSS: string): string {
   return `
-<div class="cover page">
+<div class="cover">
   <h1>DataLens</h1>
   <h2>智能数据分析报告</h2>
   <div class="cover-meta">
-    <div><span class="ml">报告文件</span>${esc(r.fileName)}</div>
-    <div><span class="ml">生成时间</span>${esc(formatDate(r.uploadTime))}</div>
-    <div><span class="ml">数据规模</span>${r.overview.rowCount.toLocaleString()} 行 × ${r.overview.colCount} 列</div>
-    <div><span class="ml">数据缺失率</span>${r.overview.missingPercent.toFixed(1)}%</div>
-    <div><span class="ml">重复行数</span>${r.overview.duplicateRows} 行</div>
+    <div><em>报告文件</em>${esc(r.fileName)}</div>
+    <div><em>生成时间</em>${esc(formatDate(r.uploadTime))}</div>
+    <div><em>数据规模</em>${r.overview.rowCount.toLocaleString()} 行 × ${r.overview.colCount} 列</div>
+    <div><em>缺失率</em>${r.overview.missingPercent.toFixed(1)}%</div>
+    <div><em>重复行</em>${r.overview.duplicateRows} 行</div>
   </div>
   <div class="cover-bottom">本报告由 DataLens 智能数据分析平台自动生成 · ${now}</div>
-  <div class="cover-accent"></div>
+  <div class="cover-stripe"></div>
 </div>`
 }
 
-// ==================== 内容区 ====================
+// ==================== 报告正文 ====================
 
-function buildContentHTML(r: AnalysisResult, chartImages: string[], now: string): string {
+function buildReportBody(r: AnalysisResult, chartImages: string[]): string {
+  const h = (title: string, content: string) => `
+<div class="section">
+  <div class="section-title">${title}</div>
+  ${content}
+</div>`
+
   let html = ''
 
-  // ===== 一、执行摘要 =====
-  html += buildSummaryHTML(r)
+  // ========== 第一部分：摘要 ==========
+  html += h('一、执行摘要', buildSummaryHTML(r))
 
-  // ===== 二、数据概览 =====
-  html += buildOverviewHTML(r)
+  // ========== 第二部分：数据概览 ==========
+  html += h('二、数据概览', buildOverviewHTML(r))
 
-  // ===== 三、可视化图表 =====
+  // ========== 第三部分：可视化图表 ==========
   if (r.charts.length > 0) {
-    html += buildChartsHTML(r.charts, chartImages)
+    html += h('三、可视化图表', buildChartsHTML(r.charts, chartImages))
   }
 
-  // ===== 四、字段详情 =====
-  html += buildFieldsHTML(r.columns)
+  // ========== 第四部分：字段详情 ==========
+  html += h('四、字段详情', buildFieldsHTML(r.columns))
 
-  // ===== 五、洞察与建议 =====
+  // ========== 第五部分：洞察与建议 ==========
   if (r.insights.length > 0) {
-    html += buildInsightsHTML(r.insights)
+    html += h('五、洞察与建议', buildInsightsHTML(r.insights, r))
   }
 
-  // ===== 声明 =====
-  html += buildDisclaimerHTML(now)
+  // ========== 尾部声明 ==========
+  html += `
+<div class="section">
+  <div class="footer-section">
+    <p><strong>报告声明</strong>：本报告由 DataLens 智能数据分析平台基于规则引擎自动生成，仅供决策参考。分析结果受数据质量和算法模型限制，不构成任何业务决策建议。</p>
+    <p><strong>数据安全</strong>：所有数据均在浏览器本地完成处理和分析，不会上传至外部服务器，保障数据隐私。</p>
+    <p><strong>生成时间</strong>：${new Date().toLocaleString('zh-CN')}</p>
+  </div>
+</div>`
 
   return html
 }
@@ -379,102 +300,117 @@ function buildContentHTML(r: AnalysisResult, chartImages: string[], now: string)
 // ==================== 摘要 ====================
 
 function buildSummaryHTML(r: AnalysisResult): string {
-  const cards = [
-    { label: '总行数', value: r.overview.rowCount.toLocaleString(), color: '#2563eb' },
-    { label: '总列数', value: String(r.overview.colCount), color: '#3b82f6' },
-    { label: '缺失值', value: `${r.overview.missingCells.toLocaleString()} (${r.overview.missingPercent.toFixed(1)}%)`, color: '#f59e0b' },
-    { label: '重复行', value: String(r.overview.duplicateRows), color: '#ef4444' },
+  const cards: [string, string, string][] = [
+    ['总行数', r.overview.rowCount.toLocaleString(), '#2563eb'],
+    ['总列数', String(r.overview.colCount), '#3b82f6'],
+    ['缺失值', `${r.overview.missingCells.toLocaleString()} (${r.overview.missingPercent.toFixed(1)}%)`, '#f59e0b'],
+    ['重复行', String(r.overview.duplicateRows), '#ef4444'],
   ]
 
-  // 核心发现（最多6条）
-  let insightHTML = ''
-  const top = r.insights.slice(0, 6)
-  if (top.length > 0) {
-    insightHTML = `<h4 style="font-size:15px;font-weight:700;color:#1e293b;margin:20px 0 10px 0;">核心发现</h4>`
+  // 综合描述
+  let desc = `本次分析对文件「${esc(r.fileName)}」进行了解读。数据集包含 ${r.overview.rowCount.toLocaleString()} 行记录，${r.overview.colCount} 个字段。`
+
+  if (r.overview.missingPercent <= 3) {
+    desc += `数据质量良好，缺失率仅 ${r.overview.missingPercent.toFixed(1)}%。`
+  } else {
+    desc += `数据存在一定缺失（${r.overview.missingPercent.toFixed(1)}%），建议关注数据质量。`
+  }
+
+  if (r.overview.duplicateRows > 0) {
+    desc += `发现 ${r.overview.duplicateRows} 行重复记录，分析时已去重处理。`
+  }
+
+  // 类型分布摘要
+  const nc = r.columns.filter(c => c.type === 'number').length
+  const sc = r.columns.filter(c => c.type === 'string').length
+  const dc = r.columns.filter(c => c.type === 'date').length
+  desc += `字段类型分布：${nc} 个数值型、${sc} 个文本型、${dc} 个日期型。`
+
+  // 核心发现列表
+  let findingsHTML = ''
+  if (r.insights.length > 0) {
+    findingsHTML = `<p class="desc" style="margin-top:14px; font-weight:600; color:#1e293b;">核心发现</p>`
+    const top = r.insights.slice(0, 8)
     for (const ins of top) {
       const c = INSIGHT_COLORS[ins.type] || '#3b82f6'
       const label = INSIGHT_LABELS[ins.type] || '信息'
-      insightHTML += `
-      <div style="display:flex;align-items:flex-start;gap:8px;margin:6px 0;font-size:13px;line-height:1.6;">
-        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${c};flex-shrink:0;margin-top:6px;"></span>
-        <span style="display:inline-block;background:${c};color:#fff;font-size:10px;font-weight:600;padding:1px 8px;border-radius:9px;flex-shrink:0;margin-top:3px;">${esc(label)}</span>
-        <span style="color:#475569;">${esc(ins.title)}</span>
-      </div>`
+      findingsHTML += `
+  <div style="display:flex;align-items:flex-start;gap:8px;margin:6px 0 6px 4px;font-size:12px;line-height:1.6;">
+    <span style="display:inline-block;min-width:8px;height:8px;border-radius:50%;background:${c};flex-shrink:0;margin-top:6px;"></span>
+    <span style="display:inline-block;background:${c};color:#fff;font-size:10px;font-weight:600;padding:1px 8px;border-radius:9px;flex-shrink:0;margin-top:3px;">${esc(label)}</span>
+    <span style="color:#475569;flex:1;">${esc(ins.title)} — ${esc(ins.content.slice(0, 80))}${ins.content.length > 80 ? '…' : ''}</span>
+  </div>`
     }
   }
 
   return `
-<div class="page">
-  <div class="section">
-    <div class="section-title">一、执行摘要</div>
-    <div class="card-row">
-      ${cards.map(c => `
-        <div class="card">
-          <div class="card-value" style="color:${c.color}">${esc(c.value)}</div>
-          <div class="card-label">${esc(c.label)}</div>
-        </div>
-      `).join('')}
+<p class="desc">${desc}</p>
+<div class="cards">
+  ${cards.map(c => `
+    <div class="card">
+      <div class="card-val" style="color:${c[2]}">${esc(c[1])}</div>
+      <div class="card-lbl">${esc(c[0])}</div>
     </div>
-    ${insightHTML}
-  </div>
-</div>`
+  `).join('')}
+</div>
+${findingsHTML}`
 }
 
 // ==================== 数据概览 ====================
 
 function buildOverviewHTML(r: AnalysisResult): string {
-  const desc = `本次分析对文件「${esc(r.fileName)}」进行了全面的数据解读。该数据集共包含 ${r.overview.rowCount.toLocaleString()} 行记录和 ${r.overview.colCount} 个字段。`
-
-  const rows = [
-    ['总记录数', `${r.overview.rowCount.toLocaleString()} 行`, r.overview.rowCount >= 100 ? '样本量充足' : '样本量偏少'],
-    ['字段数量', `${r.overview.colCount} 列`, r.overview.colCount >= 5 ? '维度丰富' : '维度较少'],
-    ['缺失单元格', `${r.overview.missingCells.toLocaleString()} 个`, r.overview.missingPercent <= 5 ? '质量良好' : '需关注'],
-    ['缺失比例', `${r.overview.missingPercent.toFixed(2)}%`, r.overview.missingPercent < 3 ? '可接受' : '建议处理'],
-    ['完全重复行', `${r.overview.duplicateRows} 行`, r.overview.duplicateRows === 0 ? '无重复' : '存在重复'],
+  const rows: [string, string, string][] = [
+    ['总记录数', `${r.overview.rowCount.toLocaleString()} 行`,
+      r.overview.rowCount >= 100 ? '样本量充足，分析结果可信' : '样本量偏少，结论仅供参考'],
+    ['字段数量', `${r.overview.colCount} 列`,
+      r.overview.colCount >= 5 ? '维度丰富，支持多角度分析' : '维度较少，建议补充更多字段'],
+    ['有效单元格', `${(r.overview.rowCount * r.overview.colCount - r.overview.missingCells).toLocaleString()} 个`,
+      r.overview.missingPercent <= 3 ? '数据完整性良好' : '存在缺失，需关注'],
+    ['缺失单元格', `${r.overview.missingCells.toLocaleString()} 个（${r.overview.missingPercent.toFixed(2)}%）`,
+      r.overview.missingPercent <= 1 ? '可忽略' : r.overview.missingPercent <= 5 ? '可接受，建议补充' : '建议优先处理缺失值'],
+    ['完全重复行', `${r.overview.duplicateRows} 行`,
+      r.overview.duplicateRows === 0 ? '无重复记录' : `存在重复，建议检查数据来源`],
   ]
 
+  const nc = r.columns.filter(c => c.type === 'number').length
+  const sc = r.columns.filter(c => c.type === 'string').length
+  const dc = r.columns.filter(c => c.type === 'date').length
+
+  let typeDesc = `字段构成：${nc} 个数值型（适合统计指标计算）、${sc} 个文本型（适合分类汇总）、${dc} 个日期型（适合时间序列分析）。`
+
   return `
-<div class="page">
-  <div class="section">
-    <div class="section-title">二、数据概览</div>
-    <p style="font-size:13px;color:#64748b;margin-bottom:14px;line-height:1.7;">${desc}</p>
-    <table>
-      <thead><tr><th>数据维度</th><th>数值</th><th>评估</th></tr></thead>
-      <tbody>
-        ${rows.map(r => `<tr><td>${esc(r[0])}</td><td>${esc(r[1])}</td><td style="color:#64748b;">${esc(r[2])}</td></tr>`).join('')}
-      </tbody>
-    </table>
-  </div>
-</div>`
+<p class="desc">以下是对数据集结构、完整性和字段分布的详细评估。</p>
+<table>
+  <thead><tr><th>数据维度</th><th>数值</th><th>分析与评估</th></tr></thead>
+  <tbody>
+    ${rows.map(r => `<tr><td><strong>${esc(r[0])}</strong></td><td>${esc(r[1])}</td><td class="assess">${esc(r[2])}</td></tr>`).join('')}
+  </tbody>
+</table>
+<p class="desc">${typeDesc}</p>`
 }
 
 // ==================== 图表 ====================
 
 function buildChartsHTML(
   charts: Array<{ id: string; title: string; type: string; description: string }>,
-  chartImages: string[]
+  images: string[]
 ): string {
-  let boxes = ''
+  let html = `<p class="desc">共生成 ${charts.length} 张可视化图表，帮助直观理解数据分布与趋势。</p>`
+
   for (let i = 0; i < charts.length; i++) {
     const ch = charts[i]
-    const img = chartImages[i] || ''
-    let chHTML = `<h3>${esc(ch.title)}</h3>`
-    if (ch.description) chHTML += `<div class="desc">${esc(ch.description)}</div>`
+    const img = images[i]
+    html += `<div class="chart-box">`
+    html += `<h3>${esc(ch.title)}</h3>`
+    if (ch.description) html += `<div class="desc">${esc(ch.description)}</div>`
     if (img) {
-      chHTML += `<img src="${img}" alt="${esc(ch.title)}" />`
+      html += `<img src="${img}" alt="${esc(ch.title)}" />`
     } else {
-      chHTML += `<div class="chart-empty">[${ch.type.toUpperCase()}] ${esc(ch.title)}</div>`
+      html += `<div class="chart-empty">[${ch.type.toUpperCase()}] ${esc(ch.title)} — 图表未捕获</div>`
     }
-    boxes += `<div class="chart-box">${chHTML}</div>`
+    html += `</div>`
   }
-
-  return `
-<div class="page">
-  <div class="section">
-    <div class="section-title">三、可视化图表</div>
-    ${boxes}
-  </div>
-</div>`
+  return html
 }
 
 // ==================== 字段详情 ====================
@@ -488,17 +424,18 @@ function buildFieldsHTML(
 ): string {
   let rowsHTML = ''
   for (const col of cols) {
-    const nm = col.name.length > 12 ? col.name.slice(0, 11) + '..' : col.name
+    const nm = col.name.length > 14 ? col.name.slice(0, 13) + '…' : col.name
     const isNum = col.type === 'number'
     rowsHTML += `<tr>
-      <td style="font-weight:500;">${esc(nm)}</td>
-      <td class="type">${esc(TYPE_LABELS[col.type] || col.type)}</td>
-      <td>${col.uniqueCount}</td>
-      <td>${col.missingPercent.toFixed(1)}%</td>
-      <td>${isNum && col.min != null ? fmtN(col.min) : '-'}</td>
-      <td>${isNum && col.max != null ? fmtN(col.max) : '-'}</td>
-      <td>${isNum && col.mean != null ? fmtN(col.mean) : '-'}</td>
-    </tr>`
+  <td style="font-weight:500;">${esc(nm)}</td>
+  <td class="tp">${esc(TYPE_LABELS[col.type] || col.type)}</td>
+  <td>${col.uniqueCount.toLocaleString()}</td>
+  <td style="color:${col.missingPercent > 10 ? '#ef4444' : col.missingPercent > 5 ? '#f59e0b' : '#334155'}">${col.missingPercent.toFixed(1)}%</td>
+  <td>${isNum && col.min != null ? fmtN(col.min) : '-'}</td>
+  <td>${isNum && col.max != null ? fmtN(col.max) : '-'}</td>
+  <td>${isNum && col.mean != null ? fmtN(col.mean) : '-'}</td>
+  <td>${isNum && col.std != null ? fmtN(col.std) : '-'}</td>
+</tr>`
   }
 
   const nc = cols.filter(c => c.type === 'number').length
@@ -506,23 +443,21 @@ function buildFieldsHTML(
   const dt = cols.filter(c => c.type === 'date').length
 
   return `
-<div class="page">
-  <div class="section">
-    <div class="section-title">四、字段详情</div>
-    <table>
-      <thead><tr><th>字段名</th><th>类型</th><th>唯一值</th><th>缺失率</th><th>最小值</th><th>最大值</th><th>均值</th></tr></thead>
-      <tbody>${rowsHTML}</tbody>
-    </table>
-    <p style="font-size:12px;color:#94a3b8;margin-top:8px;">字段构成：${nc}个数值型 · ${st}个文本型 · ${dt}个日期型 · 共${cols.length}个字段</p>
-  </div>
-</div>`
+<p class="desc">以下列出数据集中所有字段的基本统计信息。数值型字段包含最小值、最大值、均值、标准差；文本型字段显示唯一值数量。</p>
+<table>
+  <thead><tr><th>字段名</th><th>类型</th><th>唯一值</th><th>缺失率</th><th>最小值</th><th>最大值</th><th>均值</th><th>标准差</th></tr></thead>
+  <tbody>${rowsHTML}</tbody>
+</table>
+<p style="font-size:12px;color:#94a3b8;margin-top:6px;">共 ${cols.length} 个字段：${nc} 数值型 · ${st} 文本型 · ${dt} 日期型</p>`
 }
 
-// ==================== 洞察 ====================
+// ==================== 洞察与建议 ====================
 
 function buildInsightsHTML(
-  ins: Array<{ type: string; title: string; content: string; confidence: string }>
+  ins: Array<{ type: string; title: string; content: string; confidence: string }>,
+  r: AnalysisResult
 ): string {
+  // 分类统计
   const counts: Record<string, number> = {}
   for (const i of ins) counts[i.type] = (counts[i.type] || 0) + 1
 
@@ -530,56 +465,65 @@ function buildInsightsHTML(
   for (const [tp, cnt] of Object.entries(counts)) {
     const c = INSIGHT_COLORS[tp] || '#3b82f6'
     const label = INSIGHT_LABELS[tp] || '信息'
-    statsHTML += `<span style="color:${c};">● ${label} ${cnt}</span>`
+    statsHTML += `<span style="color:${c};">● ${label} ${cnt} 条</span>`
+  }
+
+  // 高优洞察摘要
+  const high = ins.filter(i => i.type === 'negative' || i.confidence === 'high').length
+  const pos = counts['positive'] || 0
+  const neg = counts['negative'] || 0
+
+  let summaryDesc = `本次分析共发现 ${ins.length} 条数据洞察。其中优势 ${pos} 条，风险 ${neg} 条，高优先级 ${high} 条。`
+
+  if (neg > 0) {
+    summaryDesc += `建议优先关注风险项，结合业务背景进行深入排查。`
+  }
+  if (pos > 0) {
+    summaryDesc += `优势项可作为业务优化的参考方向。`
   }
 
   let cardsHTML = ''
   for (let i = 0; i < ins.length; i++) {
     const item = ins[i]
     const c = INSIGHT_COLORS[item.type] || '#3b82f6'
-    const cl = item.confidence === 'high' ? '高置信度' : item.confidence === 'medium' ? '中等置信度' : '参考性质'
+    const cl = item.confidence === 'high' ? '高置信度' : item.confidence === 'medium' ? '中等置信度' : '需验证'
     const label = INSIGHT_LABELS[item.type] || '信息'
     const num = String(i + 1).padStart(2, '0')
 
+    // 根据置信度显示不同颜色
+    const confColor = item.confidence === 'high' ? c : item.confidence === 'medium' ? '#f59e0b' : '#94a3b8'
+
     cardsHTML += `
-    <div class="insight-card">
-      <div class="insight-bar" style="background:${c};"></div>
-      <div class="insight-body">
-        <div style="display:flex;align-items:center;margin-bottom:6px;">
-          <span class="insight-num" style="background:${c};">${num}</span>
-          <span class="insight-title" style="color:${c};">${esc(item.title)}</span>
+    <div class="ins-card">
+      <div class="ins-bar" style="background:${c};"></div>
+      <div class="ins-body">
+        <div class="ins-hdr">
+          <span class="num" style="background:${c};">${num}</span>
+          <span class="title" style="color:${c};">${esc(item.title)}</span>
         </div>
-        <div class="insight-meta">
-          <span class="insight-badge" style="background:${c};">${esc(label)}</span>
-          <span class="insight-conf">${esc(cl)}</span>
+        <div class="ins-meta">
+          <span class="badge" style="background:${c};">${esc(label)}</span>
+          <span class="conf" style="color:${confColor};">${esc(cl)}</span>
         </div>
-        <div class="insight-content">${esc(item.content)}</div>
+        <div class="body">${esc(item.content)}</div>
       </div>
     </div>`
   }
 
   return `
-<div class="page">
-  <div class="section">
-    <div class="section-title">五、洞察与建议</div>
-    <div class="insight-stats">
-      ${statsHTML}
-    </div>
-    ${cardsHTML}
-  </div>
-</div>`
-}
-
-// ==================== 声明 ====================
-
-function buildDisclaimerHTML(now: string): string {
-  return `
-<div class="page">
-  <div class="disclaimer">
-    <p><strong>报告声明：</strong>本报告由 DataLens 智能数据分析平台基于规则引擎自动生成，仅供参考。分析结果受数据质量和算法限制影响，不构成任何业务决策建议。</p>
-    <p style="margin-top:8px;"><strong>数据处理：</strong>所有数据均在浏览器本地完成处理和分析，不会上传至任何外部服务器，确保数据安全与隐私。</p>
-    <p style="margin-top:8px;"><strong>生成时间：</strong>${now}</p>
-  </div>
+<p class="desc">${summaryDesc}</p>
+<div class="insight-stats">${statsHTML}</div>
+${cardsHTML}
+<div class="summary-block">
+  <strong>📊 综合建议：</strong>基于 ${r.overview.rowCount.toLocaleString()} 行数据的分析，${
+    r.overview.missingPercent <= 3
+      ? '数据整体质量良好，分析结果具备较高参考价值。'
+      : '建议优先处理数据缺失问题以提高分析准确性。'
+  }${
+    ins.length > 5
+      ? '共发现 ' + ins.length + ' 条洞察，涵盖数据质量、趋势特征、异常检测等多个维度，建议逐条复核。'
+      : '洞察数量有限，建议上传更全面的数据以获得更丰富的分析结论。'
+  }
 </div>`
 }
 
@@ -591,8 +535,9 @@ function esc(s: string): string {
 
 function fmtN(n: number | undefined): string {
   if (n == null) return '-'
-  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(2) + 'M'
-  if (Math.abs(n) >= 1000) return (n / 1000).toFixed(1) + 'K'
+  if (Math.abs(n) >= 1e7) return (n / 1e6).toFixed(1) + 'M'
+  if (Math.abs(n) >= 10000) return (n / 1000).toFixed(1) + 'K'
+  if (Math.abs(n) >= 1000) return n.toLocaleString()
   return Number.isInteger(n) ? String(n) : n.toFixed(2)
 }
 
