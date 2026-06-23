@@ -1,6 +1,6 @@
 // 主应用组件
 
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useRef } from 'react'
 import FileUpload from './components/FileUpload'
 import DataOverview from './components/DataOverview'
 import ChartDisplay from './components/ChartDisplay'
@@ -8,6 +8,7 @@ import InsightReport from './components/InsightReport'
 import ColumnDetails from './components/ColumnDetails'
 import { analyzeData } from './utils/dataAnalyzer'
 import { saveToHistory, getHistory, formatTime, clearHistory } from './utils/history'
+import { exportElementToPDF } from './utils/pdfExport'
 import type { DataTable, AnalysisResult, HistoryRecord } from './types'
 
 type View = 'home' | 'analyzing' | 'result' | 'history'
@@ -17,6 +18,8 @@ export default function App() {
   const [error, setError] = useState<string>('')
   const [result, setResult] = useState<AnalysisResult | null>(null)
   const [history, setHistory] = useState<HistoryRecord[]>([])
+  const [exporting, setExporting] = useState(false)
+  const resultRef = useRef<HTMLDivElement>(null)
 
   // 处理文件上传完成
   const handleFileLoaded = useCallback((data: DataTable) => {
@@ -61,6 +64,20 @@ export default function App() {
       setHistory([])
     }
   }, [])
+
+  // 导出PDF
+  const handleExportPDF = useCallback(async () => {
+    if (!resultRef.current || !result) return
+    setExporting(true)
+    try {
+      await exportElementToPDF(resultRef.current, result.fileName)
+    } catch (e) {
+      setError(`导出失败：${e instanceof Error ? e.message : '未知错误'}`)
+      setTimeout(() => setError(''), 5000)
+    } finally {
+      setExporting(false)
+    }
+  }, [result])
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -190,7 +207,7 @@ export default function App() {
 
         {/* 分析结果 */}
         {view === 'result' && result && (
-          <div className="space-y-8">
+          <div ref={resultRef} className="space-y-8">
             {/* 文件信息 */}
             <div className="flex items-center justify-between bg-white rounded-xl border border-slate-200 px-6 py-4 fade-in">
               <div className="flex items-center gap-3">
@@ -204,15 +221,36 @@ export default function App() {
                   <p className="text-xs text-slate-400">分析时间：{formatTime(result.uploadTime)}</p>
                 </div>
               </div>
-              <button
-                onClick={handleBack}
-                className="flex items-center gap-1.5 px-4 py-2 bg-primary-600 text-white text-sm font-medium rounded-lg hover:bg-primary-700 transition-colors"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                </svg>
-                分析新文件
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleExportPDF}
+                  disabled={exporting}
+                  className="flex items-center gap-1.5 px-4 py-2 bg-slate-100 text-slate-700 text-sm font-medium rounded-lg hover:bg-slate-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {exporting ? (
+                    <>
+                      <div className="w-4 h-4 border-2 border-slate-300 border-t-slate-600 rounded-full animate-spin" />
+                      导出中...
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                      </svg>
+                      导出PDF
+                    </>
+                  )}
+                </button>
+                <button
+                  onClick={handleBack}
+                  className="flex items-center gap-1.5 px-4 py-2 bg-primary-600 text-white text-sm font-medium rounded-lg hover:bg-primary-700 transition-colors"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+                  </svg>
+                  分析新文件
+                </button>
+              </div>
             </div>
 
             {/* 各模块 */}
