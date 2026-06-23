@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.workbuddy/
+sample-data/
+*.tsbuildinfo
+.env
+.env.local
+.DS_Store
+Thumbs.db
